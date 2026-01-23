@@ -52,10 +52,54 @@ uv run pytest tests/test_patch_linears.py -v
 4. Do not simplify code just to pass linters - correct code is preferred
 5. Add descriptive error messages when debugging
 
+## Analysis & Verification Tools
+
+The project provides built-in tools to verify CoreML conversion and Neural Engine usage. Agents **MUST** use these tools when creating examples or verifying new models.
+
+```python
+from coremlmodels import analyze_compute_plan, inspect_mil_program
+
+# 1. Check Compute Device Selection (CPU, GPU, NE)
+analyze_compute_plan(mlmodel)
+
+# 2. Inspect Deep MIL Structure (Shapes, DTypes, Constants)
+inspect_mil_program(mlmodel)
+```
+
+**What to look for:**
+- **`analyze_compute_plan`**: Confirm `ios16.conv` layers are selected for `NeuralEngine` (NE).
+- **`inspect_mil_program`**: Verify input shapes match 4D expectations `(B, C, 1, 1)` and check values of constants.
+
+## Example Output
+
+### Compute Plan Analysis
+```text
+Operation            | Identifier                     | Selected Device | Cost       | Supported Devices
+------------------------------------------------------------------------------------------------------------------------
+ios16.conv           | input_1_cast_fp16              | NeuralEngine    | 6.65e-01   | CPU,GPU,NE
+ios16.relu           | x_3_cast_fp16                  | NeuralEngine    | 1.53e-03   | CPU,GPU,NE
+```
+
+### Deep MIL Inspection
+```text
+Operation: conv
+  Output: input_1_cast_fp16 [1, 4096, 1, 1] (fp16)
+  Inputs:
+    - bias: Weights [4096] (fp16)
+    - dilations: [1, 1] [2] (int32)
+    - groups: 1 [] (int32)
+    - pad: [0, 0, 0, 0] [4] (int32)
+    - pad_type: "valid" [] (string)
+    - strides: [1, 1] [2] (int32)
+    - weight: Weights [4096, 4096, 1, 1] (fp16)
+    - x: input [1, 4096, 1, 1] (fp16)
+```
+
 ## Key Files
 
 | File | Purpose |
 |------|---------|
 | `src/coremlmodels/patch_linears.py` | Core Linear→Conv2d conversion logic |
+| `src/coremlmodels/analysis.py` | Tools for Compute Plan and MIL inspection |
 | `tests/test_patch_linears.py` | Tests verifying equivalence |
 | `pyproject.toml` | Project configuration and dependencies |

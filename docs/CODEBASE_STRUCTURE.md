@@ -12,11 +12,12 @@ coremlmodels/
 ├── src/
 │   └── coremlmodels/
 │       ├── __init__.py           # Package exports
-│       └── patch_linears.py      # Core conversion module
+│       ├── patch_linears.py      # Core conversion module
+│       └── analysis.py           # Analysis tools
 ├── tests/
 │   └── test_patch_linears.py     # Test suite
 ├── docs/
-│   ├── AGENTS.md                 # AI agent guidelines (this file)
+│   ├── AGENTS.md                 # AI agent guidelines
 │   ├── CODEBASE_STRUCTURE.md     # This file
 │   ├── CODING_STANDARDS.md       # Style and patterns
 │   ├── CONVERSION_GUIDE.md       # Domain-specific conversion info
@@ -27,6 +28,13 @@ coremlmodels/
 ```
 
 ## Key Files
+
+### `src/coremlmodels/analysis.py`
+
+Tools for verifying model conversion and performance:
+
+- **`analyze_compute_plan(mlmodel)`** - Prints table of operations and their selected compute device (CPU/GPU/NE).
+- **`inspect_mil_program(mlmodel)`** - Deep inspection of compiled MIL operations, showing input shapes, dtypes, and constant values.
 
 ### `src/coremlmodels/patch_linears.py`
 
