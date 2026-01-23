@@ -1,0 +1,19 @@
+[project]
+name = "coremlmodels"
+version = "0.1.0"
+description = "Convert HuggingFace PyTorch models to CoreML with Neural Engine backend"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.7.0",
+    "coremltools>=9.0",
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
