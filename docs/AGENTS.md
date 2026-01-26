@@ -4,7 +4,10 @@ This document provides guidelines for AI coding agents working on the coremlmode
 
 ## Project Overview
 
-**coremlmodels** is a library for converting HuggingFace PyTorch models to CoreML format optimized for Apple's Neural Engine backend. The core approach involves replacing `nn.Linear` layers with equivalent 1x1 `conv2d` operations that are better aligned with Neural Engine compute units.
+**coremlmodels** is a library for converting HuggingFace PyTorch models to CoreML format optimized for Apple's Neural Engine backend. The core approach involves:
+
+1. **Linear → Conv2d**: Replace `nn.Linear` layers with equivalent 1x1 `conv2d` operations
+2. **RMSNorm → LayerNorm**: Convert RMSNorm to LayerNorm-equivalent operations to avoid FP16 overflow
 
 ## Quick Start
 
@@ -15,91 +18,125 @@ uv sync
 # Run tests
 uv run pytest tests/ -v
 
-# Run specific test file
-uv run pytest tests/test_patch_linears.py -v
+# Run example scripts
+uv run python examples/rmsnorm_conversion_example.py
 ```
 
-## Documentation Structure
+## Documentation Reading Order
 
-- [Project Structure](CODEBASE_STRUCTURE.md) - Directory layout and file organization
-- [Coding Standards](CODING_STANDARDS.md) - Style guidelines, patterns, and conventions
-- [Conversion Guide](CONVERSION_GUIDE.md) - Domain-specific conversion patterns (Linear→Conv2d)
-- [Testing Guide](TESTING_GUIDE.md) - Testing requirements and patterns
+1. **This file (AGENTS.md)** - Start here for overview and constraints
+2. **[Codebase Structure](CODEBASE_STRUCTURE.md)** - Directory layout and module descriptions
+3. **[RMSNorm Patching](RMSNORM_PATCHING.md)** - Mathematical background for RMSNorm conversion
+4. **[Coding Standards](CODING_STANDARDS.md)** - Style guidelines and patterns (reference as needed)
+
+## Architecture Overview
+
+### Patching Pattern
+
+All patchers follow the same pattern:
+1. Wrap original PyTorch layer in an `nn.Module` subclass
+2. Transform weights in `__init__` (reshape, concatenate, etc.)
+3. Implement equivalent forward pass that CoreMLTools can optimize
+4. Provide `patch_model_*` function for recursive model traversal
+
+### Input Tensor Format
+
+All patched layers expect **4D tensors in channels-first format**:
+- Shape: `(batch, channels, height, width)` or `(batch, channels, 1, seq_len)`
+- For sequence models, use last dimension for sequence length to maximize Neural Engine utilization
+
+### CoreML Conversion Flow
+
+```
+PyTorch Model → Patch Layers → torch.jit.trace → ct.convert → MLModel
+```
+
+## Key Modules
+
+| Module | Classes/Functions | Purpose |
+|--------|-------------------|---------|
+| `patch_linears.py` | `LinearToConv2dPatcher`, `patch_model_linears` | Linear → 1x1 Conv2d |
+| `patch_rmsnorm.py` | `RMSNormToLayerNormPatcher`, `patch_model_rmsnorms` | RMSNorm → LayerNorm ops |
+| `analysis.py` | `analyze_compute_plan`, `inspect_mil_program` | CoreML verification tools |
 
 ## Critical Constraints
 
-1. **Input Shapes**: The patched model layers expect 4D input tensors `(batch, channels, 1, 1)`. Do NOT reshape inputs automatically - let shape mismatches surface as errors during inference to catch bugs early.
+1. **4D Input Tensors**: Patched layers expect `(batch, channels, H, W)`. No automatic reshaping.
 
-2. **Weight Handling**: Weights are kept as views (not cloned) to avoid doubling memory usage. The reshape from `(out, in)` to `(out, in, 1, 1)` is sufficient - no transpose needed.
+2. **Weight Views**: Use `.detach()` without `.clone()` to avoid doubling memory.
 
-3. **No Auto-reshape**: Do not add automatic 2D→4D or 4D→2D conversion layers. Users are responsible for providing correct input shapes.
+3. **Neural Engine Scheduling**: Use large workloads (e.g., seq_len ≥ 512) to trigger Neural Engine. Small workloads may run on CPU.
 
-4. **Minimal Testing**: Tests should verify output equivalence between original and patched implementations. Keep tests focused and minimal.
-
-5. **Detach from Gradients**: When creating patcher weights, always detach from the original linear layer's gradient computation to avoid issues.
-
-## Communication Style
-
-- Use markdown for formatting
-- Never make up information - ask for clarification if unsure
-- Format code blocks with file paths: ```path/to/file.py
-
-## Development Workflow
-
-1. Read the relevant documentation before making changes
-2. Check existing tests for patterns
-3. Make minimal changes to pass tests
-4. Do not simplify code just to pass linters - correct code is preferred
-5. Add descriptive error messages when debugging
+4. **Epsilon Handling**: RMSNorm implementations use different attribute names (`eps` vs `variance_epsilon`). The patcher handles both.
 
 ## Analysis & Verification Tools
 
-The project provides built-in tools to verify CoreML conversion and Neural Engine usage. Agents **MUST** use these tools when creating examples or verifying new models.
+**Always verify CoreML conversion with these tools:**
 
 ```python
 from coremlmodels import analyze_compute_plan, inspect_mil_program
 
-# 1. Check Compute Device Selection (CPU, GPU, NE)
+# Check which device runs each operation
 analyze_compute_plan(mlmodel)
 
-# 2. Inspect Deep MIL Structure (Shapes, DTypes, Constants)
+# Inspect MIL operations and shapes
 inspect_mil_program(mlmodel)
 ```
 
-**What to look for:**
-- **`analyze_compute_plan`**: Confirm `ios16.conv` layers are selected for `NeuralEngine` (NE).
-- **`inspect_mil_program`**: Verify input shapes match 4D expectations `(B, C, 1, 1)` and check values of constants.
+### What to Look For
 
-## Example Output
+**In `analyze_compute_plan` output:**
+- `Selected Device` should show `NeuralEngine` for compute-heavy ops (`conv`, `layer_norm`)
+- If showing `CPU`, increase workload size (larger batch, seq_len, or dim)
 
-### Compute Plan Analysis
-```text
-Operation            | Identifier                     | Selected Device | Cost       | Supported Devices
-------------------------------------------------------------------------------------------------------------------------
-ios16.conv           | input_1_cast_fp16              | NeuralEngine    | 6.65e-01   | CPU,GPU,NE
-ios16.relu           | x_3_cast_fp16                  | NeuralEngine    | 1.53e-03   | CPU,GPU,NE
+**In `inspect_mil_program` output:**
+- `layer_norm` operation confirms RMSNorm fusion worked
+- Check tensor shapes match expectations
+
+### Example Output (Neural Engine)
+
+```
+Operation            | Selected Device | Supported Devices
+---------------------------------------------------------
+ios16.layer_norm     | NeuralEngine    | CPU,GPU,NE
+ios16.conv           | NeuralEngine    | CPU,GPU,NE
 ```
 
-### Deep MIL Inspection
-```text
-Operation: conv
-  Output: input_1_cast_fp16 [1, 4096, 1, 1] (fp16)
-  Inputs:
-    - bias: Weights [4096] (fp16)
-    - dilations: [1, 1] [2] (int32)
-    - groups: 1 [] (int32)
-    - pad: [0, 0, 0, 0] [4] (int32)
-    - pad_type: "valid" [] (string)
-    - strides: [1, 1] [2] (int32)
-    - weight: Weights [4096, 4096, 1, 1] (fp16)
-    - x: input [1, 4096, 1, 1] (fp16)
+## Known Limitations & Future Work
+
+### RMSNorm Weight Fusion
+
+Currently, the RMSNorm weight multiplication is **not fused** into the `layer_norm` MIL operation. The weight appears as a separate `mul` operation after `layer_norm`:
+
+```
+layer_norm → mul (weight) → split
 ```
 
-## Key Files
+The `layer_norm` MIL op supports a `gamma` parameter that could fuse this multiplication. A custom graph pass could detect and fuse this pattern:
 
-| File | Purpose |
-|------|---------|
-| `src/coremlmodels/patch_linears.py` | Core Linear→Conv2d conversion logic |
-| `src/coremlmodels/analysis.py` | Tools for Compute Plan and MIL inspection |
-| `tests/test_patch_linears.py` | Tests verifying equivalence |
-| `pyproject.toml` | Project configuration and dependencies |
+```
+# Current (unfused)
+layer_norm(x) → mul(weight)
+
+# Desired (fused)  
+layer_norm(x, gamma=weight)
+```
+
+**Task for future work:** Write a CoreMLTools graph pass to fuse the element-wise multiplication into the `layer_norm` gamma parameter.
+
+## Development Workflow
+
+1. Read relevant documentation (this file + module-specific docs)
+2. Check existing tests for patterns
+3. Make minimal changes
+4. Verify with `analyze_compute_plan` and `inspect_mil_program`
+5. Run tests: `uv run pytest -v`
+
+## File Naming Conventions
+
+| Type | Convention | Example |
+|------|------------|---------|
+| Patcher modules | `patch_<layer_type>.py` | `patch_rmsnorm.py` |
+| Test files | `test_patch_<layer_type>.py` | `test_patch_rmsnorms.py` |
+| Example scripts | `<feature>_conversion_example.py` | `rmsnorm_conversion_example.py` |
+| Documentation | `SCREAMING_SNAKE_CASE.md` | `RMSNORM_PATCHING.md` |
