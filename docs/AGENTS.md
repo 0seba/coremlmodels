@@ -281,7 +281,9 @@ Operation: concat
   Inputs:
     - axis: 1 [] (int32)
     - interleave: false [] (bool)
-    - values: (input
+    - values:
+      - input [1, 512, 1, 512] (fp16)
+      - var_10_cast_fp16 [1, 512, 1, 512] (fp16)
 ----------------------------------------
 Operation: layer_norm
   Output: out_1_cast_fp16 [1, 1024, 1, 512] (fp16)

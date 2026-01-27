@@ -59,6 +59,34 @@ def analyze_compute_plan(mlmodel):
         print(f"Compute Plan Analysis failed: {e}")
 
 
+def parse_mil_args(args_str):
+    """
+    Parses a comma-separated argument string, respecting nested parentheses/brackets.
+    Returns a list of split strings.
+    """
+    args = []
+    current = []
+    level = 0
+
+    for char in args_str:
+        if char in "([{":
+            level += 1
+            current.append(char)
+        elif char in ")]}":
+            level -= 1
+            current.append(char)
+        elif char == "," and level == 0:
+            args.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+
+    if current:
+        args.append("".join(current).strip())
+
+    return args
+
+
 def inspect_mil_program(mlmodel):
     """
     Parses the compiled MIL structure to provide deep inspection of operations,
@@ -166,20 +194,61 @@ def inspect_mil_program(mlmodel):
                 print(f"  Output: {out_name} {shape} ({dtype})")
                 print("  Inputs:")
 
-                content_args = args_raw
-                if ")[" in content_args:
-                    content_args = content_args.split(")[")[0]
-                content_args = content_args.strip("()")
+                # Robustly extract arguments inside the FIRST balanced parenthesis pair
+                # args_raw includes the opening parenthesis of the op call
+                start_idx = args_raw.find("(")
+                end_idx = -1
+                if start_idx != -1:
+                    depth = 0
+                    for i in range(start_idx, len(args_raw)):
+                        if args_raw[i] == "(":
+                            depth += 1
+                        elif args_raw[i] == ")":
+                            depth -= 1
+                        if depth == 0:
+                            end_idx = i
+                            break
 
-                pairs = content_args.split(", ")
+                content_args = ""
+                if start_idx != -1 and end_idx != -1:
+                    # Exclude the outer parentheses
+                    content_args = args_raw[start_idx + 1 : end_idx]
+
+                # Parse arguments by splitting on top-level commas
+                pairs = parse_mil_args(content_args)
 
                 for p in pairs:
-                    if "=" in p:
+                    if " = " in p:
                         items = p.split(" = ", 1)
                         if len(items) == 2:
                             k, v = items
                             k = k.strip()
                             v = v.strip()
+
+                            # Check if value is a tuple (e.g., "(x, y)")
+                            if v.startswith("(") and v.endswith(")"):
+                                print(f"    - {k}:")
+                                inner_content = v[1:-1]
+                                inner_vals = parse_mil_args(inner_content)
+                                for idx, iv in enumerate(inner_vals):
+                                    iv = iv.strip()
+                                    elem_info = iv
+                                    if iv in var_map:
+                                        info = var_map[iv]
+                                        s = info["shape"]
+                                        d = info["dtype"]
+                                        if "value" in info:
+                                            val = info["value"]
+                                            if val == "Weights":
+                                                elem_info = f"{iv} {s} ({d}) [Weights]"
+                                            elif val == "Blob":
+                                                elem_info = f"{iv} {s} ({d}) [Blob]"
+                                            else:
+                                                elem_info = f"{iv} {s} ({d}): {val}"
+                                        else:
+                                            elem_info = f"{iv} {s} ({d})"
+                                    print(f"      - {elem_info}")
+                                continue
 
                             info_str = v  # Default to just name
 
