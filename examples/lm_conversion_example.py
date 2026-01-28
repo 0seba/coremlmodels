@@ -1,29 +1,46 @@
-"""Example: Converting a HuggingFace Language Model to CoreML with KV Cache.
+"""Example: Converting HuggingFace Language Models to CoreML with KV Cache.
 
-This example demonstrates:
-1. Loading a Qwen2 model from HuggingFace
-2. Patching attention, RMSNorm, and Linear layers for Neural Engine
-3. Wrapping with LanguageModelWrapper for KV cache as CoreML state
-4. Converting to CoreML with StateType for stateful inference
-5. Comparing PyTorch and CoreML outputs
-6. Analyzing the converted model
+This example demonstrates architecture-agnostic conversion that automatically
+detects and patches the appropriate layers based on the model type.
 
-NOTE: For development/debugging, you can modify LanguageModelWrapper to
-process only the first transformer layer by uncommenting the line:
-    # for decoder_layer in self.layer.layers[:1]:
+Supported architectures:
+- Qwen2 (e.g., "Qwen/Qwen2-0.5B")
+- Qwen3 (e.g., "Qwen/Qwen3-0.6B")
+
+The script:
+1. Loads a model from HuggingFace
+2. Auto-detects the architecture from config.model_type
+3. Patches attention, RMSNorm, and Linear layers for Neural Engine
+4. Wraps with LanguageModelWrapper for KV cache as CoreML state
+5. Converts to CoreML with StateType for stateful inference
+6. Compares PyTorch and CoreML outputs
+7. Analyzes the converted model
+
+Usage:
+    # Convert Qwen2 model
+    uv run python examples/lm_conversion_example.py
+
+    # Convert Qwen3 model
+    uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-0.6B
+
+    # Custom cache length
+    uv run python examples/lm_conversion_example.py --cache-length 4096
 """
 
+import argparse
 import copy
 
 import numpy as np
 import torch
 import coremltools as ct
 from transformers import AutoConfig, AutoModel
-from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2RMSNorm
 
 from coremlmodels import (
     analyze_compute_plan,
     create_coreml_state_specs,
+    find_target_classes,
+    get_architecture_config,
+    get_supported_architectures,
     inspect_mil_program,
     LanguageModelWrapper,
     patch_model_attention,
@@ -32,19 +49,47 @@ from coremlmodels import (
 )
 
 
-def main():
-    print("CoreML Language Model Conversion Example")
+def convert_language_model(
+    model_name: str,
+    seq_len: int = 8,
+    cache_length: int = 2048,
+    batch_size: int = 1,
+    output_path: str | None = None,
+    verbose: bool = True,
+):
+    """Convert a HuggingFace language model to CoreML.
+
+    Args:
+        model_name: HuggingFace model name (e.g., "Qwen/Qwen2-0.5B").
+        seq_len: Sequence length for tracing.
+        cache_length: Maximum KV cache length.
+        batch_size: Batch size for the model.
+        output_path: Path to save the converted model. If None, auto-generated.
+        verbose: Print detailed information during conversion.
+
+    Returns:
+        The converted CoreML model.
+    """
+    print("CoreML Language Model Conversion")
     print("=" * 60)
 
-    # Configuration
-    model_name = "Qwen/Qwen2-0.5B"  # Small model for testing
-    seq_len = 8  # Sequence length for tracing (can be flexible at runtime)
-    cache_length = 2048  # Maximum KV cache length
-    batch_size = 1
-
-    # 1. Load model
-    print(f"\n[1] Loading model: {model_name}")
+    # 1. Load config and detect architecture
+    print(f"\n[1] Loading config: {model_name}")
     config = AutoConfig.from_pretrained(model_name)
+    model_type = config.model_type
+
+    print(f"    Model type: {model_type}")
+    print(f"    Supported architectures: {get_supported_architectures()}")
+
+    # Get architecture-specific configuration
+    arch_config = get_architecture_config(model_type)
+    print("    Architecture config:")
+    print(f"      - Attention classes: {arch_config.attention_class_names}")
+    print(f"      - RMSNorm classes: {arch_config.rmsnorm_class_names}")
+    print(f"      - Has QK-norm: {arch_config.has_qk_norm}")
+
+    # 2. Load model
+    print(f"\n[2] Loading model: {model_name}")
     model = AutoModel.from_pretrained(
         model_name,
         torch_dtype=torch.float32,
@@ -62,32 +107,39 @@ def main():
     print(f"    Num heads: {config.num_attention_heads}")
     print(f"    Num KV heads: {config.num_key_value_heads}")
 
-    # 2. Patch Linear layers
-    print("\n[2] Patching Linear layers...")
-    with torch.inference_mode():
-        patch_model_linears(model, verbose=True)
+    # 3. Find target classes from the loaded model
+    print("\n[3] Finding target classes...")
+    attention_classes = find_target_classes(model, arch_config.attention_class_names)
+    rmsnorm_classes = find_target_classes(model, arch_config.rmsnorm_class_names)
+    print(f"    Attention classes: {[c.__name__ for c in attention_classes]}")
+    print(f"    RMSNorm classes: {[c.__name__ for c in rmsnorm_classes]}")
 
-    # 3. Patch RMSNorm layers
-    print("\n[3] Patching RMSNorm layers...")
+    # 4. Patch Linear layers
+    print("\n[4] Patching Linear layers...")
+    with torch.inference_mode():
+        patch_model_linears(model, verbose=verbose)
+
+    # 5. Patch RMSNorm layers (including q_norm/k_norm if present)
+    print("\n[5] Patching RMSNorm layers...")
     with torch.inference_mode():
         patch_model_rmsnorms(
             model,
-            target_classes=(Qwen2RMSNorm,),
-            verbose=True,
+            target_classes=rmsnorm_classes,
+            verbose=verbose,
         )
 
-    # 4. Patch attention layers
-    print("\n[4] Patching attention layers...")
+    # 6. Patch attention layers
+    print("\n[6] Patching attention layers...")
     with torch.inference_mode():
         patch_model_attention(
             model,
-            target_classes=(Qwen2Attention,),
+            target_classes=attention_classes,
             config=config,
-            verbose=True,
+            verbose=verbose,
         )
 
-    # 5. Wrap model for CoreML conversion
-    print("\n[5] Creating LanguageModelWrapper...")
+    # 7. Wrap model for CoreML conversion
+    print("\n[7] Creating LanguageModelWrapper...")
     with torch.inference_mode():
         wrapped_model = LanguageModelWrapper(
             model,
@@ -98,8 +150,8 @@ def main():
         wrapped_model.eval()
     print(f"    {wrapped_model}")
 
-    # 6. Prepare example inputs for tracing
-    print("\n[6] Preparing example inputs...")
+    # 8. Prepare example inputs for tracing
+    print("\n[8] Preparing example inputs...")
     # Channels-first format: (batch, hidden_dim, 1, seq_len)
     example_inputs = (
         torch.randn((batch_size, hidden_dim, 1, seq_len), dtype=torch.float32),
@@ -108,14 +160,14 @@ def main():
     print(f"    Input shape: {example_inputs[0].shape}")
     print(f"    Position ID shape: {example_inputs[1].shape}")
 
-    # 7. Trace the model
-    print("\n[7] Tracing model with torch.jit.trace...")
+    # 9. Trace the model
+    print("\n[9] Tracing model with torch.jit.trace...")
     with torch.inference_mode():
         traced_model = torch.jit.trace(wrapped_model, example_inputs)
     print("    Tracing complete!")
 
-    # 8. Convert to CoreML
-    print("\n[8] Converting to CoreML...")
+    # 10. Convert to CoreML
+    print("\n[10] Converting to CoreML...")
     mlmodel = ct.convert(
         traced_model,
         inputs=[
@@ -138,13 +190,17 @@ def main():
         minimum_deployment_target=ct.target.iOS18,
     )
 
-    # 9. Save model
-    model_path = f"qwen2_lm_seqlen_{seq_len}.mlpackage"
-    mlmodel.save(model_path)
-    print(f"    Saved to: {model_path}")
+    # 11. Save model
+    if output_path is None:
+        # Generate output path from model name
+        model_short_name = model_name.split("/")[-1].lower().replace("-", "_")
+        output_path = f"{model_short_name}_seqlen_{seq_len}.mlpackage"
 
-    # 10. Compare PyTorch and CoreML outputs
-    print("\n[9] Comparing PyTorch vs CoreML outputs...")
+    mlmodel.save(output_path)
+    print(f"    Saved to: {output_path}")
+
+    # 12. Compare PyTorch and CoreML outputs
+    print("\n[11] Comparing PyTorch vs CoreML outputs...")
 
     # Create test input in channels-first format: (batch, hidden_dim, 1, seq_len)
     test_input_cf = np.random.randn(batch_size, hidden_dim, 1, seq_len).astype(
@@ -155,25 +211,14 @@ def main():
     # Convert to sequence-first format for original model: (batch, seq_len, hidden_dim)
     test_input_sf = test_input_tensor.squeeze(2).transpose(1, 2)
 
-    # Run original PyTorch model (only first N layers for comparison)
-    # Temporarily limit layers to match the wrapped model's layer count
-    num_layers_to_use = 2  # Match the [:1] in LanguageModelWrapper
+    # Run original PyTorch model
     with torch.inference_mode():
-        # Save original layers and temporarily replace with subset
-        original_layers = original_model.layers
-        # original_model.layers = original_layers[:num_layers_to_use]
-        original_model.layers = original_layers
-
-        # Run full model forward
         original_output = original_model(
             inputs_embeds=test_input_sf,
             position_ids=torch.arange(seq_len).unsqueeze(0),
         )
 
-        # Restore original layers
-        original_model.layers = original_layers
-
-        # Convert to channels-first for comparison: (batch, seq_len, hidden_dim) -> (batch, hidden_dim, 1, seq_len)
+        # Convert to channels-first for comparison
         pytorch_output = (
             original_output.last_hidden_state.transpose(1, 2).unsqueeze(2).numpy()
         )
@@ -213,8 +258,8 @@ def main():
     else:
         print("\n    [WARNING] Outputs differ significantly - check implementation")
 
-    # 11. Test stateful inference (second forward pass)
-    print("\n[10] Testing stateful inference (second forward pass)...")
+    # 13. Test stateful inference (second forward pass)
+    print("\n[12] Testing stateful inference (second forward pass)...")
     output2 = mlmodel.predict(
         {
             "inputs_embeds": test_input_cf,
@@ -225,23 +270,84 @@ def main():
     print(f"    Second output shape: {output2['output'].shape}")
     print(f"    Second output sample: {output2['output'].flatten()[:5]}")
 
-    # 12. Analyze compute plan
-    print("\n[11] Compute Plan Analysis")
+    # 14. Analyze compute plan
+    print("\n[13] Compute Plan Analysis")
     print("     Looking for Neural Engine scheduling...")
     analyze_compute_plan(mlmodel)
 
-    # 13. Inspect MIL program
-    print("\n[12] MIL Program Inspection")
+    # 15. Inspect MIL program
+    print("\n[14] MIL Program Inspection")
     print("     Looking for conv, layer_norm operations...")
     inspect_mil_program(mlmodel)
 
     print("\n" + "=" * 60)
     print("Conversion complete!")
-    print(f"Model saved to: {model_path}")
+    print(f"Model saved to: {output_path}")
+    print(f"Architecture: {model_type}")
+    print(f"QK-norm enabled: {arch_config.has_qk_norm}")
     print("\nExpected MIL operations:")
     print("  - conv (from Linear patching)")
     print("  - layer_norm (from RMSNorm fusion)")
     print("  - read_state/coreml_update_state (from KV cache)")
+
+    return mlmodel
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert HuggingFace language models to CoreML",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Convert Qwen2 model (default)
+    python examples/lm_conversion_example.py
+
+    # Convert Qwen3 model
+    python examples/lm_conversion_example.py --model Qwen/Qwen3-0.6B
+
+    # Custom settings
+    python examples/lm_conversion_example.py --model Qwen/Qwen2-0.5B --seq-len 16 --cache-length 4096
+        """,
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="Qwen/Qwen2-0.5B",
+        help="HuggingFace model name (default: Qwen/Qwen2-0.5B)",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=8,
+        help="Sequence length for tracing (default: 8)",
+    )
+    parser.add_argument(
+        "--cache-length",
+        type=int,
+        default=2048,
+        help="Maximum KV cache length (default: 2048)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output path for the CoreML model (default: auto-generated)",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Reduce verbosity",
+    )
+
+    args = parser.parse_args()
+
+    convert_language_model(
+        model_name=args.model,
+        seq_len=args.seq_len,
+        cache_length=args.cache_length,
+        output_path=args.output,
+        verbose=not args.quiet,
+    )
 
 
 if __name__ == "__main__":

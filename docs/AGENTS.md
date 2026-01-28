@@ -8,8 +8,9 @@
 
 1. **Convert Linear layers to 1x1 Conv2d** - ANE favors 4D tensors in channels-first format (NCHW)
 2. **Patch RMSNorm layers** - Trick to mitigate ANE's FP16 accumulation issues with RMSNorm's `sqrt(mean(x²))`
-3. **Patch Attention layers** - Channels-first GQA with CoreML state for KV cache
+3. **Patch Attention layers** - Channels-first GQA with CoreML state for KV cache, supports QK-norm (Qwen3-style)
 4. **Language Model Wrapper** - Full LM conversion with pre-computed position embeddings and stateful KV cache
+5. **Architecture Registry** - Auto-detection of model architecture for appropriate patching configuration
 
 ## Essential Commands
 
@@ -26,8 +27,9 @@ uv run pytest tests/test_patch_rmsnorms.py -v
 # Run simple conversion example
 uv run python examples/rmsnorm_conversion_example.py
 
-# Run full LLM conversion example (Qwen2 with KV cache)
-uv run python examples/lm_conversion_example.py
+# Run full LLM conversion example (architecture-agnostic)
+uv run python examples/lm_conversion_example.py                    # Qwen2 (default)
+uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-0.6B  # Qwen3 with QK-norm
 
 # Lint code
 uv run ruff check .
@@ -136,32 +138,49 @@ When `ct.convert()` runs, it applies graph optimization passes that detect patte
 ```python
 # From src/coremlmodels/patch_rmsnorm.py
 class RMSNormToLayerNormPatcher(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Step 1: Concatenate [x, -x] along channel dimension
-        x_concat = torch.cat([x, -x], dim=1)
+    def forward(self, x: torch.Tensor, axis: int = 1) -> torch.Tensor:
+        # Step 1: Concatenate [x, -x] along the normalization axis
+        x_concat = torch.cat([x, -x], dim=axis)
 
         # Step 2: LayerNorm-equivalent ops (will be fused by CoreML)
         # CoreML detects this pattern: mean -> sub -> square -> mean -> rsqrt -> mul
         # And fuses it into: layer_norm operation
-        channels_mean = x_concat.float().mean(dim=1, keepdim=True)
+        channels_mean = x_concat.float().mean(dim=axis, keepdim=True)
         zero_mean = x_concat.float() - channels_mean
-        variance = (zero_mean * zero_mean).mean(dim=1, keepdim=True)
+        variance = (zero_mean * zero_mean).mean(dim=axis, keepdim=True)
         out = zero_mean * (variance + self.eps).rsqrt()
 
-        # Step 3: Apply weight and take first half (x portion)
+        # Step 3: Apply weight (reshaped for the axis) and take first half
         if self.weight is not None:
-            out = out * self.weight
-        out = torch.chunk(out, 2, dim=1)[0]
+            out = out * weight_reshaped  # Weight reshaped for broadcasting
+        out = torch.chunk(out, 2, dim=axis)[0]
 
         return out.to(x.dtype)
 ```
+
+**Flexible Axis Normalization:**
+
+The patcher supports normalizing over any axis via the `axis` parameter:
+
+```python
+# Default: normalize over channel dimension (axis=1)
+out = rmsnorm_patcher(x)  # x shape: (batch, channels, 1, seq)
+
+# Normalize over a different axis (e.g., head_dim in attention)
+out = rmsnorm_patcher(x, axis=2)  # x shape: (batch, heads, head_dim, seq)
+
+# Last dimension: uses F.layer_norm internally (efficient)
+out = rmsnorm_patcher(x, axis=-1)  # x shape: (batch, heads, seq, head_dim)
+```
+
+This flexibility is essential for QK-norm in attention layers where Q and K need normalization over `head_dim` without reshaping.
 
 **Why this matters:**
 - CoreML's `layer_norm` operation handles FP16 accumulation differently, avoiding overflow
 - Fused operations have lower memory bandwidth and faster execution
 - The `[x, -x]` trick makes LayerNorm mathematically equivalent to RMSNorm
 
-**Another important note: We cannot use Pytorch's builtin `LayerNorm` because it always normalizes along the last dimensions, but we structure our data in a channels-first format for better ANE compatibility**
+**Another important note: Pytorch's builtin `LayerNorm` always normalizes along the last dimensions, but we structure our data in a channels-first format for better ANE compatibility, this means that in the general case we cannot use it and have to rely on CoreML for operator fusion, but have a separate case for the last dimension where we can use it**
 
 ### CoreML State for KV Cache
 
@@ -223,16 +242,19 @@ def forward(self, hidden_states, past_key_values, cache_position, ...):
     # CoreML requires the write index to be passed as a size [1] array
     # This is passed from the wrapper: position_id with shape (1,)
 
+    # Get sequence length from key_states (avoids dynamic shape issues)
+    seq_len = key_states.size(2)
+
     # Write new keys/values at current position
     key_cache[
         self.layer_idx : self.layer_idx + 1,
         :,
-        cache_position : cache_position + q_len,  # cache_position is shape (1,)
+        cache_position : cache_position + seq_len,
     ] = key_states
     value_cache[
         self.layer_idx : self.layer_idx + 1,
         :,
-        cache_position : cache_position + q_len,
+        cache_position : cache_position + seq_len,
     ] = value_states
 
     # Read full cache for attention computation
@@ -304,11 +326,62 @@ For full language model conversion, attention layers need special handling:
 - Explicit GQA (Grouped Query Attention) loop for better scheduling
 - KV cache integration with CoreML state
 - External position embeddings (pre-computed at model level)
+- **QK-norm support** (Qwen3-style) - Auto-detected and applied before RoPE
 
 See the implementation in `src/coremlmodels/patch_attention.py`:
 - `AttentionPatcher` - Wraps attention layers for ANE-optimized execution
 - `patch_model_attention()` - Recursively patches attention layers
 - `rotate_half()`, `apply_rotary_pos_emb()` - RoPE utilities
+
+**QK-norm (Qwen3-style):**
+
+Some architectures (e.g., Qwen3) apply RMSNorm to Q and K states before RoPE. The `AttentionPatcher` auto-detects this via `hasattr(attention_layer, "q_norm")` and applies normalization using the axis-aware RMSNorm patcher:
+
+```python
+# Auto-detected in AttentionPatcher.__init__
+self.has_qk_norm = hasattr(attention_layer, "q_norm") and hasattr(attention_layer, "k_norm")
+
+# Applied in forward() before RoPE
+if self.has_qk_norm:
+    # Query: (batch, num_heads, head_dim, seq) - normalize over axis=2
+    query_states = self.q_norm(query_states, axis=2)
+    # Key: (batch, num_kv_heads, seq, head_dim) - normalize over axis=-1
+    key_states = self.k_norm(key_states, axis=-1)
+```
+
+### Architecture Registry
+
+The `registry.py` module provides architecture auto-detection for applying the correct patching configuration:
+
+```python
+from coremlmodels import get_architecture_config, find_target_classes, get_supported_architectures
+
+# Check supported architectures
+print(get_supported_architectures())  # ['qwen2', 'qwen3']
+
+# Get config for a model type
+config = get_architecture_config("qwen3")
+# ArchitectureConfig(
+#     attention_class_names=('Qwen3Attention',),
+#     rmsnorm_class_names=('Qwen3RMSNorm',),
+#     has_qk_norm=True,
+# )
+
+# Find actual classes from a loaded model
+attention_classes, rmsnorm_classes = find_target_classes(model, config)
+```
+
+**Adding new architectures:**
+
+To support a new model architecture, add an entry to `ARCHITECTURE_REGISTRY` in `registry.py`:
+
+```python
+ARCHITECTURE_REGISTRY["llama"] = ArchitectureConfig(
+    attention_class_names=("LlamaAttention",),
+    rmsnorm_class_names=("LlamaRMSNorm",),
+    has_qk_norm=False,
+)
+```
 
 ## Available Patching Methods
 
@@ -316,6 +389,10 @@ See the implementation in `src/coremlmodels/patch_attention.py`:
 from coremlmodels import (
     patch_model_linears,
     patch_model_rmsnorms,
+    patch_model_attention,
+    get_architecture_config,
+    find_target_classes,
+    get_supported_architectures,
 )
 
 # Method 1: Patch all Linear layers to 1x1 Conv2d
@@ -324,7 +401,10 @@ patched = patch_model_linears(model)
 # Method 2: Patch RMSNorm layers to LayerNorm-fusable ops
 patched = patch_model_rmsnorms(patched)
 
-# Both methods support:
+# Method 3: Patch attention layers for ANE-optimized execution
+patched = patch_model_attention(patched, target_classes, config)
+
+# All patching methods support:
 # - skip_modules: List of module paths to skip
 # - verbose: Print patched module names
 patched = patch_model_linears(
@@ -338,6 +418,14 @@ patched = patch_model_rmsnorms(
     target_classes=(nn.RMSNorm, CustomRMSNorm),  # Custom RMSNorm classes
     verbose=True
 )
+
+# Architecture-aware patching (recommended for HuggingFace models):
+arch_config = get_architecture_config(model.config.model_type)
+attention_classes, rmsnorm_classes = find_target_classes(model, arch_config)
+
+patched = patch_model_rmsnorms(model, target_classes=rmsnorm_classes)
+patched = patch_model_linears(patched)
+patched = patch_model_attention(patched, target_classes=attention_classes, config=model.config)
 ```
 
 
@@ -523,9 +611,10 @@ ios16.conv           | input_cast_fp16                | NeuralEngine    | 1.73e-
 | Module | Classes/Functions | Purpose |
 |--------|-------------------|---------|
 | `patch_linears.py` | `LinearToConv2dPatcher`, `patch_model_linears` | Linear -> 1x1 Conv2d |
-| `patch_rmsnorm.py` | `RMSNormToLayerNormPatcher`, `patch_model_rmsnorms` | RMSNorm -> LayerNorm ops |
-| `patch_attention.py` | `AttentionPatcher`, `patch_model_attention` | Attention -> ANE-optimized channels-first |
+| `patch_rmsnorm.py` | `RMSNormToLayerNormPatcher`, `patch_model_rmsnorms` | RMSNorm -> LayerNorm ops (axis-aware) |
+| `patch_attention.py` | `AttentionPatcher`, `patch_model_attention` | Attention -> ANE-optimized channels-first with QK-norm |
 | `lm_model_wrapper.py` | `LanguageModelWrapper`, `create_coreml_state_specs` | LM wrapper with KV cache state |
+| `registry.py` | `ArchitectureConfig`, `get_architecture_config`, `find_target_classes` | Architecture auto-detection |
 | `analysis.py` | `analyze_compute_plan`, `inspect_mil_program` | CoreML verification tools |
 
 ## Known Limitations
@@ -542,19 +631,36 @@ The weight appears as a separate `mul` operation after `layer_norm`. Future work
 
 ## Full Language Model Conversion Example
 
-For converting complete HuggingFace language models (e.g., Qwen2, Llama) with KV cache, see:
+For converting complete HuggingFace language models with KV cache, see:
 
 ```bash
+# Convert Qwen2 (default)
 uv run python examples/lm_conversion_example.py
+
+# Convert Qwen3 (with QK-norm)
+uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-0.6B
+
+# Custom parameters
+uv run python examples/lm_conversion_example.py \
+    --model Qwen/Qwen2-0.5B \
+    --seq-len 16 \
+    --cache-length 512 \
+    --output my_model.mlpackage
+
+# Quiet mode (less verbose output)
+uv run python examples/lm_conversion_example.py --quiet
 ```
 
+**Supported architectures:** Qwen2, Qwen3 (see `get_supported_architectures()`)
+
 This example demonstrates:
-1. Loading a Qwen2 model from HuggingFace
-2. Patching Linear, RMSNorm, and Attention layers
-3. Wrapping with `LanguageModelWrapper` for KV cache as CoreML state
-4. Converting with `ct.StateType` for stateful inference
-5. Comparing PyTorch vs CoreML outputs
-6. Analyzing compute plan and MIL program
+1. **Auto-detecting architecture** from model config using the registry
+2. **Finding target classes** dynamically (attention, RMSNorm)
+3. Patching Linear, RMSNorm, and Attention layers (with QK-norm if applicable)
+4. Wrapping with `LanguageModelWrapper` for KV cache as CoreML state
+5. Converting with `ct.StateType` for stateful inference
+6. Comparing PyTorch vs CoreML outputs
+7. Analyzing compute plan and MIL program
 
 ## Development Workflow
 

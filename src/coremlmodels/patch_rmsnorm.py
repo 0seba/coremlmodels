@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class RMSNormToLayerNormPatcher(nn.Module):
@@ -23,9 +24,14 @@ class RMSNormToLayerNormPatcher(nn.Module):
     operations that CoreMLTools will fuse into a LayerNorm operation. This
     avoids FP16 accumulation overflow issues on the Neural Engine.
 
-    The trick: concatenate [x, -x] along channel dimension, then perform
+    The trick: concatenate [x, -x] along the normalization dimension, then perform
     LayerNorm-equivalent operations. The mean of [x, -x] is 0, and the
     variance equals mean(x^2), giving us RMSNorm behavior.
+
+    Supports flexible axis selection:
+    - axis=1 (default): Channel dimension normalization for 4D tensors
+    - axis=-1: Last dimension normalization using F.layer_norm
+    - Other axes: Uses the concat trick with dynamic weight reshaping
 
     Args:
         rmsnorm_layer: The RMSNorm layer to patch. Supports nn.RMSNorm and
@@ -33,9 +39,8 @@ class RMSNormToLayerNormPatcher(nn.Module):
 
     Attributes:
         eps: Epsilon value for numerical stability.
-        weight: Concatenated weight tensor [original_weight, zeros] for
-                scaling only the first half of the output.
-        bias: Zero tensor (RMSNorm has no bias, but LayerNorm ops need it).
+        weight: Original weight tensor (1D) for scaling.
+        normalized_shape: Size of the normalization dimension.
     """
 
     DEFAULT_TARGET_CLASSES: Tuple[Type[nn.Module], ...] = (nn.RMSNorm,)
@@ -55,20 +60,10 @@ class RMSNormToLayerNormPatcher(nn.Module):
             # Default fallback (matches PyTorch's internal default for RMSNorm)
             self.eps = 1e-5
 
-        # Handle weight - concatenate [weight, zeros] for the [x, -x] trick
+        # Store original weight (1D) - reshaping done in forward based on axis
         if hasattr(rmsnorm_layer, "weight") and rmsnorm_layer.weight is not None:
             original_weight = rmsnorm_layer.weight.detach()
-            # Shape: (1, 2*normalized_shape, 1, 1) for 4D input
-            self.register_buffer(
-                "weight",
-                torch.cat(
-                    [
-                        original_weight.view(1, -1, 1, 1),
-                        torch.zeros_like(original_weight).view(1, -1, 1, 1),
-                    ],
-                    dim=1,
-                ),
-            )
+            self.register_buffer("weight", original_weight)
             self.normalized_shape = original_weight.shape[0]
         else:
             self.weight = None
@@ -78,21 +73,71 @@ class RMSNormToLayerNormPatcher(nn.Module):
             else:
                 self.normalized_shape = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, axis: int = 1) -> torch.Tensor:
         """Forward pass using LayerNorm-equivalent operations.
 
-        The sequence of operations (mean, sub, square, mean, rsqrt, mul)
-        is detected by CoreMLTools and fused into a LayerNorm operation.
+        The sequence of operations is detected by CoreMLTools and fused into
+        a LayerNorm operation when axis=1. For axis=-1, uses F.layer_norm.
 
         Args:
-            x: Input tensor of shape (batch_size, channels, 1, 1)
+            x: Input tensor. For axis=1, expects shape (batch, channels, 1, seq).
                Channels must match the original normalized_shape.
+            axis: Dimension to normalize over. Defaults to 1 (channel dimension).
+                  Use -1 for last dimension normalization (uses F.layer_norm).
 
         Returns:
-            Output tensor of shape (batch_size, channels, 1, 1)
+            Normalized output tensor with same shape as input.
         """
-        # Concatenate [x, -x] along channel dimension
-        x_concat = torch.cat([x, -x], dim=1)
+        # Handle negative axis
+        if axis < 0:
+            axis = x.ndim + axis
+
+        if axis == x.ndim - 1:
+            # Last dimension: use F.layer_norm (efficient for this case)
+            return self._forward_functional(x)
+        else:
+            # Other dimensions: use concat trick
+            return self._forward_concat_trick(x, axis)
+
+    def _forward_functional(self, x: torch.Tensor) -> torch.Tensor:
+        """Use F.layer_norm for last dimension normalization (RMSNorm equivalent).
+
+        This approach concatenates [x, -x] along the last dimension and applies
+        F.layer_norm, which is efficient for last-dimension normalization.
+        """
+        input_dtype = x.dtype
+
+        # Create [x, -x] along last dimension for RMSNorm behavior
+        x_concat = torch.cat([x, -x], dim=-1)
+
+        # Prepare weight: [weight, zeros] to only scale the x portion
+        if self.weight is not None:
+            weight_concat = torch.cat([self.weight, torch.zeros_like(self.weight)])
+        else:
+            weight_concat = None
+
+        # Apply layer_norm on the concatenated last dimension
+        out = F.layer_norm(
+            x_concat.float(),
+            [x_concat.size(-1)],
+            weight=weight_concat,
+            bias=None,
+            eps=self.eps,
+        )
+
+        # Take the first half (x portion)
+        out = torch.chunk(out, 2, dim=-1)[0]
+
+        return out.to(input_dtype)
+
+    def _forward_concat_trick(self, x: torch.Tensor, axis: int) -> torch.Tensor:
+        """Use [x, -x] concat trick for arbitrary axis normalization.
+
+        This method handles normalization over any axis by concatenating
+        [x, -x] along that axis and performing LayerNorm-equivalent operations.
+        """
+        # Concatenate [x, -x] along the specified axis
+        x_concat = torch.cat([x, -x], dim=axis)
 
         # Store input dtype for restoration
         input_dtype = x_concat.dtype
@@ -101,8 +146,8 @@ class RMSNormToLayerNormPatcher(nn.Module):
         x_float = x_concat.float()
 
         # LayerNorm-equivalent operations (CoreMLTools will fuse these)
-        # 1. Compute channel mean
-        channels_mean = x_float.mean(dim=1, keepdim=True)
+        # 1. Compute mean along the normalization axis
+        channels_mean = x_float.mean(dim=axis, keepdim=True)
 
         # 2. Zero-center the input
         zero_mean = x_float - channels_mean
@@ -111,18 +156,26 @@ class RMSNormToLayerNormPatcher(nn.Module):
         zero_mean_sq = zero_mean * zero_mean
 
         # 4. Compute variance and reciprocal sqrt
-        variance = zero_mean_sq.mean(dim=1, keepdim=True)
+        variance = zero_mean_sq.mean(dim=axis, keepdim=True)
         denom = (variance + self.eps).rsqrt()
 
         # 5. Normalize
         out = zero_mean * denom
 
-        # Apply weight and bias if present
+        # Apply weight if present - reshape based on axis
         if self.weight is not None:
-            out = out * self.weight
+            # Create [weight, zeros] for the concat trick
+            weight_concat = torch.cat([self.weight, torch.zeros_like(self.weight)])
+
+            # Reshape weight for broadcasting: [1, 1, ..., 2*normalized_shape, ..., 1]
+            shape = [1] * x_concat.ndim
+            shape[axis] = weight_concat.shape[0]
+            weight_reshaped = weight_concat.view(*shape)
+
+            out = out * weight_reshaped
 
         # Take the first half (the x portion, not -x)
-        out = torch.chunk(out, 2, dim=1)[0]
+        out = torch.chunk(out, 2, dim=axis)[0]
 
         # Restore original dtype
         return out.to(input_dtype)

@@ -63,10 +63,8 @@ class LanguageModelWrapper(nn.Module):
         config = model.config
         num_layers = config.num_hidden_layers
         num_kv_heads = config.num_key_value_heads
-        if "head_dim" in config:
-            head_dim = config.head_dim
-        else:
-            head_dim = config.hidden_size // config.num_attention_heads
+        # Check for explicit head_dim first (Qwen3 uses explicit head_dim != hidden_size // num_heads)
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
 
         # Initialize KV cache as registered buffers
         # Shape: (num_layers, num_kv_heads, cache_length, head_dim)

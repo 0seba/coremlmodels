@@ -12,6 +12,13 @@ from .patch_attention import (
 )
 from .patch_linears import LinearToConv2dPatcher, patch_model_linears
 from .patch_rmsnorm import RMSNormToLayerNormPatcher, patch_model_rmsnorms
+from .registry import (
+    ARCHITECTURE_REGISTRY,
+    ArchitectureConfig,
+    find_target_classes,
+    get_architecture_config,
+    get_supported_architectures,
+)
 
 __all__ = [
     # Linear patching
@@ -28,6 +35,12 @@ __all__ = [
     # Language model wrapper
     "LanguageModelWrapper",
     "create_coreml_state_specs",
+    # Architecture registry
+    "ARCHITECTURE_REGISTRY",
+    "ArchitectureConfig",
+    "get_architecture_config",
+    "find_target_classes",
+    "get_supported_architectures",
     # Analysis utilities
     "analyze_compute_plan",
     "inspect_mil_program",

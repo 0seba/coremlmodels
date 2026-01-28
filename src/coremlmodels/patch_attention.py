@@ -60,6 +60,7 @@ class AttentionPatcher(nn.Module):
     - Applies RoPE from external position embeddings (passed to forward)
     - Uses explicit loop over GQA groups for better ANE utilization
     - Updates KV cache in-place via index assignments
+    - Supports QK-norm (Qwen3-style) where Q and K are normalized before RoPE
 
     Args:
         attention_layer: The attention layer to patch (e.g., Qwen2Attention).
@@ -74,6 +75,7 @@ class AttentionPatcher(nn.Module):
         num_heads: Number of query heads.
         num_kv_heads: Number of KV heads.
         head_dim: Head dimension.
+        has_qk_norm: Whether QK-norm is applied (auto-detected).
     """
 
     # Default attention classes to target (extend as needed)
@@ -97,6 +99,15 @@ class AttentionPatcher(nn.Module):
 
         # Store original module info for reference
         self.module_name: Optional[str] = None
+
+        # Auto-detect QK-norm (Qwen3-style)
+        # These norms should already be patched by patch_model_rmsnorms
+        self.has_qk_norm = hasattr(attention_layer, "q_norm") and hasattr(
+            attention_layer, "k_norm"
+        )
+        if self.has_qk_norm:
+            self.q_norm = attention_layer.q_norm
+            self.k_norm = attention_layer.k_norm
 
     def forward(
         self,
@@ -124,7 +135,7 @@ class AttentionPatcher(nn.Module):
         Returns:
             Output tensor of shape (batch, hidden_dim, 1, seq_len).
         """
-        bsz, _, _, q_len = hidden_states.size()
+        bsz = hidden_states.size(0)
 
         # Project Q, K, V using the wrapped layer's projections
         query_states = self.layer.q_proj(hidden_states)
@@ -134,13 +145,20 @@ class AttentionPatcher(nn.Module):
         # Reshape for multi-head attention
         # Query: (batch, num_heads, head_dim, seq_len) - keep head_dim before seq for RoPE
         # Key/Value: (batch, num_kv_heads, seq_len, head_dim) - standard format for matmul
-        query_states = query_states.view(bsz, self.num_heads, self.head_dim, q_len)
-        key_states = key_states.view(
-            bsz, self.num_kv_heads, self.head_dim, q_len
-        ).transpose(2, 3)
-        value_states = value_states.view(
-            bsz, self.num_kv_heads, self.head_dim, q_len
-        ).transpose(2, 3)
+        query_states = query_states.view(bsz, self.num_heads, self.head_dim, -1)
+        key_states = key_states.view(bsz, self.num_kv_heads, self.head_dim, -1).transpose(2, 3)
+        value_states = value_states.view(bsz, self.num_kv_heads, self.head_dim, -1).transpose(2, 3)
+
+        # Apply QK-norm if present (Qwen3-style)
+        # QK-norm normalizes Q and K over head_dim BEFORE applying RoPE
+        if self.has_qk_norm:
+            # Query: (batch, num_heads, head_dim, seq) - normalize over dim=2 (head_dim)
+            # Use axis parameter - no reshaping needed
+            query_states = self.q_norm(query_states, axis=2)
+
+            # Key: (batch, num_kv_heads, seq, head_dim) - normalize over dim=-1 (head_dim)
+            # Use axis=-1 which uses F.layer_norm internally
+            key_states = self.k_norm(key_states, axis=-1)
 
         # Apply rotary position embeddings
         # cos, sin: (batch, seq_len, head_dim) - standard format
@@ -157,15 +175,17 @@ class AttentionPatcher(nn.Module):
 
         # Write new keys and values to cache at current position
         # Cache shape: (num_layers, num_kv_heads, cache_len, head_dim)
+        # key_states shape: (batch, num_kv_heads, seq_len, head_dim)
+        seq_len = key_states.size(2)
         key_cache[
             self.layer_idx : self.layer_idx + 1,
             :,
-            cache_position : cache_position + q_len,
+            cache_position : cache_position + seq_len,
         ] = key_states
         value_cache[
             self.layer_idx : self.layer_idx + 1,
             :,
-            cache_position : cache_position + q_len,
+            cache_position : cache_position + seq_len,
         ] = value_states
 
         # Read full cache for this layer
@@ -179,11 +199,11 @@ class AttentionPatcher(nn.Module):
         # Compute attention for each GQA group
         attn_outputs = []
         for q, k, v in zip(query_states, key_states, value_states):
-            # q: (batch, heads_per_group, head_dim, q_len)
+            # q: (batch, heads_per_group, head_dim, seq_len)
             # k: (1, 1, cache_len, head_dim)
             # v: (1, 1, cache_len, head_dim)
 
-            # Attention: k @ q -> (batch, 1, cache_len, q_len)
+            # Attention: k @ q -> (batch, 1, cache_len, seq_len)
             attn_weights = k @ q
             attn_weights = attn_weights / math.sqrt(self.head_dim)
 
@@ -194,18 +214,18 @@ class AttentionPatcher(nn.Module):
             # Softmax over cache dimension
             attn_weights = attn_weights.softmax(dim=2)
 
-            # Output: attn_weights.T @ v -> (batch, heads_per_group, head_dim, q_len)
-            # Actually: (batch, 1, q_len, cache_len) @ (1, 1, cache_len, head_dim)
-            #         = (batch, 1, q_len, head_dim)
+            # Output: attn_weights.T @ v -> (batch, heads_per_group, seq_len, head_dim)
+            # Actually: (batch, 1, seq_len, cache_len) @ (1, 1, cache_len, head_dim)
+            #         = (batch, 1, seq_len, head_dim)
             attn_output = attn_weights.transpose(-1, -2) @ v
             attn_outputs.append(attn_output)
 
         # Concatenate all GQA groups
         attn_output = torch.cat(attn_outputs, dim=1)
 
-        # Reshape: (batch, num_heads, q_len, head_dim) -> (batch, hidden_dim, 1, q_len)
+        # Reshape: (batch, num_heads, seq_len, head_dim) -> (batch, hidden_dim, 1, seq_len)
         attn_output = attn_output.transpose(2, 3).contiguous()
-        attn_output = attn_output.reshape(bsz, self.num_heads * self.head_dim, 1, q_len)
+        attn_output = attn_output.reshape(bsz, self.num_heads * self.head_dim, 1, -1)
 
         # Output projection
         attn_output = self.layer.o_proj(attn_output)
@@ -218,7 +238,8 @@ class AttentionPatcher(nn.Module):
             f"layer_idx={self.layer_idx}, "
             f"num_heads={self.num_heads}, "
             f"num_kv_heads={self.num_kv_heads}, "
-            f"head_dim={self.head_dim})"
+            f"head_dim={self.head_dim}, "
+            f"has_qk_norm={self.has_qk_norm})"
         )
 
 
@@ -257,7 +278,8 @@ def patch_model_attention(
     # Extract config values
     num_heads = config.num_attention_heads
     num_kv_heads = config.num_key_value_heads
-    head_dim = config.hidden_size // num_heads
+    # Check for explicit head_dim first (Qwen3 uses explicit head_dim != hidden_size // num_heads)
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // num_heads
 
     # Track layer index for KV cache
     layer_idx = [0]  # Use list to allow mutation in closure
