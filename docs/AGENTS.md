@@ -8,6 +8,8 @@
 
 1. **Convert Linear layers to 1x1 Conv2d** - ANE favors 4D tensors in channels-first format (NCHW)
 2. **Patch RMSNorm layers** - Trick to mitigate ANE's FP16 accumulation issues with RMSNorm's `sqrt(mean(x²))`
+3. **Patch Attention layers** - Channels-first GQA with CoreML state for KV cache
+4. **Language Model Wrapper** - Full LM conversion with pre-computed position embeddings and stateful KV cache
 
 ## Essential Commands
 
@@ -21,8 +23,11 @@ uv run pytest tests/ -v
 # Run specific test file
 uv run pytest tests/test_patch_rmsnorms.py -v
 
-# Run conversion example
+# Run simple conversion example
 uv run python examples/rmsnorm_conversion_example.py
+
+# Run full LLM conversion example (Qwen2 with KV cache)
+uv run python examples/lm_conversion_example.py
 
 # Lint code
 uv run ruff check .
@@ -157,6 +162,153 @@ class RMSNormToLayerNormPatcher(nn.Module):
 - The `[x, -x]` trick makes LayerNorm mathematically equivalent to RMSNorm
 
 **Another important note: We cannot use Pytorch's builtin `LayerNorm` because it always normalizes along the last dimensions, but we structure our data in a channels-first format for better ANE compatibility**
+
+### CoreML State for KV Cache
+
+CoreML supports **stateful models** where tensors persist across inference calls. This is essential for transformer KV caches - without state, you'd need to recompute all previous keys/values on every token.
+
+**Step 1: Define state tensors as registered buffers in PyTorch**
+
+```python
+# From src/coremlmodels/lm_model_wrapper.py
+class LanguageModelWrapper(nn.Module):
+    def __init__(self, model, cache_length=2048):
+        super().__init__()
+        # KV cache as registered buffers - these become CoreML state
+        self.register_buffer(
+            "key_cache",
+            torch.zeros(num_layers, num_kv_heads, cache_length, head_dim),
+        )
+        self.register_buffer(
+            "value_cache",
+            torch.zeros(num_layers, num_kv_heads, cache_length, head_dim),
+        )
+```
+
+**Step 2: Inform CoreML about state during conversion**
+
+```python
+import coremltools as ct
+
+# Create StateType specs for each stateful buffer
+states = [
+    ct.StateType(
+        wrapped_type=ct.TensorType(shape=wrapper.key_cache.shape),
+        name="key_cache",
+    ),
+    ct.StateType(
+        wrapped_type=ct.TensorType(shape=wrapper.value_cache.shape),
+        name="value_cache",
+    ),
+]
+
+mlmodel = ct.convert(
+    traced_model,
+    inputs=[...],
+    outputs=[...],
+    states=states,  # <-- Pass state specs here
+    compute_precision=ct.precision.FLOAT16,
+    minimum_deployment_target=ct.target.iOS18,
+)
+```
+
+**Step 3: Update and read state in forward pass**
+
+```python
+# From src/coremlmodels/patch_attention.py
+def forward(self, hidden_states, past_key_values, cache_position, ...):
+    key_cache, value_cache = past_key_values
+
+    # IMPORTANT: cache_position must be a tensor of shape (1,), not a Python int!
+    # CoreML requires the write index to be passed as a size [1] array
+    # This is passed from the wrapper: position_id with shape (1,)
+
+    # Write new keys/values at current position
+    key_cache[
+        self.layer_idx : self.layer_idx + 1,
+        :,
+        cache_position : cache_position + q_len,  # cache_position is shape (1,)
+    ] = key_states
+    value_cache[
+        self.layer_idx : self.layer_idx + 1,
+        :,
+        cache_position : cache_position + q_len,
+    ] = value_states
+
+    # Read full cache for attention computation
+    key_states = key_cache[self.layer_idx : self.layer_idx + 1]
+    value_states = value_cache[self.layer_idx : self.layer_idx + 1]
+```
+
+**Step 4: Use state at inference time**
+
+```python
+# Create state object (holds the KV cache)
+state = mlmodel.make_state()
+
+# First forward pass at position 0
+output1 = mlmodel.predict(
+    {"inputs_embeds": input1, "position_id": np.array([0], dtype=np.int32)},
+    state,  # Pass state to persist KV cache
+)
+
+# Second forward pass at position seq_len (uses cached KV)
+output2 = mlmodel.predict(
+    {"inputs_embeds": input2, "position_id": np.array([seq_len], dtype=np.int32)},
+    state,  # Same state object - KV cache is preserved
+)
+```
+
+### Pre-computed Position Embeddings
+
+ANE operates in FP16 which cannot accurately represent position indices beyond ~2048 and loses precision in the exponential, cosine, and sine operations used for rotary position embeddings (RoPE).
+
+**Solution:** Pre-compute all position embeddings at initialization in FP32, then index into them at runtime.
+
+```python
+# From src/coremlmodels/lm_model_wrapper.py
+class LanguageModelWrapper(nn.Module):
+    def __init__(self, model, cache_length=2048):
+        # Pre-compute rotary embeddings for all positions in FP32
+        position_ids = torch.arange(cache_length, dtype=torch.long).unsqueeze(0)
+        cos_emb, sin_emb = model.rotary_emb(dummy_values, position_ids)
+
+        # Store as buffers for indexing
+        self.register_buffer("cos_emb", cos_emb[0])  # (cache_length, head_dim)
+        self.register_buffer("sin_emb", sin_emb[0])
+
+    def forward(self, inputs_embeds, position_id):
+        # Index into pre-computed embeddings at runtime
+        # This indexing op typically runs on CPU, but subsequent ops run on ANE
+        position_ids = torch.arange(seq_len) + position_id
+        position_emb = (self.cos_emb[position_ids], self.sin_emb[position_ids])
+
+        # Pass to attention layers
+        for decoder_layer in self.layer.layers:
+            hidden_states = decoder_layer(
+                hidden_states,
+                position_embeddings=position_emb,  # Pre-indexed embeddings
+                ...
+            )
+```
+
+**Why this matters:**
+- Avoids FP16 precision loss in exp/cos/sin calculations
+- Indexing operations run on CPU but create minimal overhead
+- All subsequent operations run on Neural Engine without graph cuts
+
+### Attention Patching for Language Models
+
+For full language model conversion, attention layers need special handling:
+- Channels-first format (NCHW) for ANE compatibility
+- Explicit GQA (Grouped Query Attention) loop for better scheduling
+- KV cache integration with CoreML state
+- External position embeddings (pre-computed at model level)
+
+See the implementation in `src/coremlmodels/patch_attention.py`:
+- `AttentionPatcher` - Wraps attention layers for ANE-optimized execution
+- `patch_model_attention()` - Recursively patches attention layers
+- `rotate_half()`, `apply_rotary_pos_emb()` - RoPE utilities
 
 ## Available Patching Methods
 
@@ -372,6 +524,8 @@ ios16.conv           | input_cast_fp16                | NeuralEngine    | 1.73e-
 |--------|-------------------|---------|
 | `patch_linears.py` | `LinearToConv2dPatcher`, `patch_model_linears` | Linear -> 1x1 Conv2d |
 | `patch_rmsnorm.py` | `RMSNormToLayerNormPatcher`, `patch_model_rmsnorms` | RMSNorm -> LayerNorm ops |
+| `patch_attention.py` | `AttentionPatcher`, `patch_model_attention` | Attention -> ANE-optimized channels-first |
+| `lm_model_wrapper.py` | `LanguageModelWrapper`, `create_coreml_state_specs` | LM wrapper with KV cache state |
 | `analysis.py` | `analyze_compute_plan`, `inspect_mil_program` | CoreML verification tools |
 
 ## Known Limitations
@@ -385,6 +539,22 @@ layer_norm -> mul (weight) -> split
 ```
 
 The weight appears as a separate `mul` operation after `layer_norm`. Future work could write a CoreMLTools graph pass to fuse this pattern.
+
+## Full Language Model Conversion Example
+
+For converting complete HuggingFace language models (e.g., Qwen2, Llama) with KV cache, see:
+
+```bash
+uv run python examples/lm_conversion_example.py
+```
+
+This example demonstrates:
+1. Loading a Qwen2 model from HuggingFace
+2. Patching Linear, RMSNorm, and Attention layers
+3. Wrapping with `LanguageModelWrapper` for KV cache as CoreML state
+4. Converting with `ct.StateType` for stateful inference
+5. Comparing PyTorch vs CoreML outputs
+6. Analyzing compute plan and MIL program
 
 ## Development Workflow
 
