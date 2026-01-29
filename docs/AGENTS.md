@@ -12,6 +12,10 @@
 4. **Language Model Wrapper** - Full LM conversion with pre-computed position embeddings and stateful KV cache
 5. **Architecture Registry** - Auto-detection of model architecture for appropriate patching configuration
 
+## Repository navigation instructions
+
+1. **Do not read the contents of the [huggingface_models/](huggingface_models) or [reference/](reference/) directories unless I explicitly reference them or a file inside of them in my request*
+
 ## Essential Commands
 
 ```bash
@@ -30,6 +34,7 @@ uv run python examples/rmsnorm_conversion_example.py
 # Run full LLM conversion example (architecture-agnostic)
 uv run python examples/lm_conversion_example.py                    # Qwen2 (default)
 uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-0.6B  # Qwen3 with QK-norm
+uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4  # Large model chunked
 
 # Lint code
 uv run ruff check .
@@ -613,7 +618,7 @@ ios16.conv           | input_cast_fp16                | NeuralEngine    | 1.73e-
 | `patch_linears.py` | `LinearToConv2dPatcher`, `patch_model_linears` | Linear -> 1x1 Conv2d |
 | `patch_rmsnorm.py` | `RMSNormToLayerNormPatcher`, `patch_model_rmsnorms` | RMSNorm -> LayerNorm ops (axis-aware) |
 | `patch_attention.py` | `AttentionPatcher`, `patch_model_attention` | Attention -> ANE-optimized channels-first with QK-norm |
-| `lm_model_wrapper.py` | `LanguageModelWrapper`, `create_coreml_state_specs` | LM wrapper with KV cache state |
+| `lm_model_wrapper.py` | `LanguageModelWrapper`, `ChunkedLanguageModelWrapper`, `create_coreml_state_specs` | LM wrappers with KV cache state (full and chunked) |
 | `registry.py` | `ArchitectureConfig`, `get_architecture_config`, `find_target_classes` | Architecture auto-detection |
 | `graph_passes.py` | `fuse_layernorm_or_instancenorm`, `register_extended_passes` | Extended CoreMLTools graph passes |
 | `analysis.py` | `analyze_compute_plan`, `inspect_mil_program` | CoreML verification tools |
@@ -676,7 +681,32 @@ This keeps the computation graph cleaner and avoids potential inefficiencies on 
 
 ## Known Limitations
 
-(No current limitations - RMSNorm weight fusion now works with the extended graph pass)
+**Neural Engine Model Size Limit (~2GB):** Apple's Neural Engine can only load models up to approximately 2GB. For larger models (e.g., Qwen3-4B with 4 billion parameters), you must split the model into multiple chunks.
+
+## Chunked Model Conversion for Large Models
+
+For models exceeding the ~2GB Neural Engine limit, use the `--num-chunks` argument to split the model into multiple CoreML packages:
+
+```bash
+# Convert Qwen3-4B in 4 chunks
+uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4
+
+# Test chunking with fewer layers (faster debugging)
+uv run python examples/lm_conversion_example.py --num-layers 12 --num-chunks 3
+```
+
+**How chunking works:**
+- The model's transformer layers are partitioned into N chunks
+- Each chunk has its own independent KV cache (sized for its layer count)
+- Chunks are converted to separate `.mlpackage` files in an output directory
+- At inference time, chain the chunks sequentially: output of chunk N feeds into chunk N+1
+- The final chunk applies the model's output layer norm
+
+**Key classes:**
+- `ChunkedLanguageModelWrapper` - Wraps a subset of layers with its own KV cache
+- `create_chunked_coreml_state_specs()` - Creates CoreML state specs for a chunk
+
+**Verification:** The conversion script performs end-to-end verification comparing the original PyTorch model output against the chained CoreML chunks output.
 
 ## Full Language Model Conversion Example
 

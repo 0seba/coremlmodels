@@ -249,6 +249,7 @@ def patch_model_attention(
     config: object,
     skip_modules: Optional[list] = None,
     verbose: bool = False,
+    start_layer_idx: int = 0,
 ) -> nn.Module:
     """Iterate through model modules and patch attention layers.
 
@@ -262,6 +263,9 @@ def patch_model_attention(
                 and hidden_size attributes.
         skip_modules: List of module names to skip patching. Defaults to None.
         verbose: If True, print information about patched layers. Defaults to False.
+        start_layer_idx: Starting index for layer numbering. Use 0 for full models
+                        or when patching chunks where each chunk has its own KV cache
+                        with local indexing. Defaults to 0.
 
     Returns:
         The patched model with attention layers converted to ANE-optimized format.
@@ -271,6 +275,10 @@ def patch_model_attention(
         >>> from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
         >>> config = Qwen2Config()
         >>> patched = patch_model_attention(model, (Qwen2Attention,), config)
+
+        # For chunked models with local KV cache indexing:
+        >>> chunk_layers = model.layers[0:8]
+        >>> patched_chunk = patch_model_attention(chunk_layers, (Qwen2Attention,), config, start_layer_idx=0)
     """
     if skip_modules is None:
         skip_modules = []
@@ -281,8 +289,8 @@ def patch_model_attention(
     # Check for explicit head_dim first (Qwen3 uses explicit head_dim != hidden_size // num_heads)
     head_dim = getattr(config, "head_dim", None) or config.hidden_size // num_heads
 
-    # Track layer index for KV cache
-    layer_idx = [0]  # Use list to allow mutation in closure
+    # Track layer index for KV cache (starts from start_layer_idx)
+    layer_idx = [start_layer_idx]  # Use list to allow mutation in closure
 
     def _patch_module(module: nn.Module, name: str = "") -> None:
         """Recursively patch attention layers in the module."""
@@ -309,7 +317,7 @@ def patch_model_attention(
                 setattr(module, child_name, patcher)
 
                 if verbose:
-                    print(f"Patched: {full_name} -> {patcher}")
+                    print(f"Patched: {full_name} (layer_idx={layer_idx[0]}) -> {patcher}")
 
                 layer_idx[0] += 1
 

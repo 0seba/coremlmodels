@@ -4,7 +4,12 @@ __version__ = "0.1.0"
 
 from .analysis import analyze_compute_plan, inspect_mil_program
 from .graph_passes import register_extended_passes
-from .lm_model_wrapper import LanguageModelWrapper, create_coreml_state_specs
+from .lm_model_wrapper import (
+    ChunkedLanguageModelWrapper,
+    LanguageModelWrapper,
+    create_chunked_coreml_state_specs,
+    create_coreml_state_specs,
+)
 from .patch_attention import (
     AttentionPatcher,
     apply_rotary_pos_emb,
@@ -35,7 +40,9 @@ __all__ = [
     "apply_rotary_pos_emb",
     # Language model wrapper
     "LanguageModelWrapper",
+    "ChunkedLanguageModelWrapper",
     "create_coreml_state_specs",
+    "create_chunked_coreml_state_specs",
     # Architecture registry
     "ARCHITECTURE_REGISTRY",
     "ArchitectureConfig",

@@ -7,40 +7,46 @@ Supported architectures:
 - Qwen2 (e.g., "Qwen/Qwen2-0.5B")
 - Qwen3 (e.g., "Qwen/Qwen3-0.6B")
 
-The script:
-1. Loads a model from HuggingFace
-2. Auto-detects the architecture from config.model_type
-3. Patches attention, RMSNorm, and Linear layers for Neural Engine
-4. Wraps with LanguageModelWrapper for KV cache as CoreML state
-5. Converts to CoreML with StateType for stateful inference
-6. Compares PyTorch and CoreML outputs
-7. Analyzes the converted model
+The script supports two modes:
+1. Single model conversion: Converts the entire model to one CoreML package
+2. Chunked conversion: Splits the model into N chunks for large models (>2GB)
+   that exceed the Neural Engine limit
 
 Usage:
-    # Convert Qwen2 model
+    # Convert Qwen2 model (single)
     uv run python examples/lm_conversion_example.py
 
-    # Convert Qwen3 model
+    # Convert Qwen3 model (single)
     uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-0.6B
+
+    # Convert large model in 4 chunks (for models > 2GB)
+    uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4
 
     # Quick debug with only 2 layers
     uv run python examples/lm_conversion_example.py --num-layers 2
 
-    # Custom cache length
-    uv run python examples/lm_conversion_example.py --cache-length 4096
+    # Enable compute plan and MIL analysis
+    uv run python examples/lm_conversion_example.py --analyze-compute-plan --analyze-mil
 """
 
 import argparse
 import copy
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import coremltools as ct
 from transformers import AutoConfig, AutoModel
 
 from coremlmodels import (
     analyze_compute_plan,
     create_coreml_state_specs,
+    create_chunked_coreml_state_specs,
+    ChunkedLanguageModelWrapper,
     find_target_classes,
     get_architecture_config,
     get_supported_architectures,
@@ -50,53 +56,81 @@ from coremlmodels import (
     patch_model_linears,
     patch_model_rmsnorms,
     register_extended_passes,
+    RMSNormToLayerNormPatcher,
 )
 
 
-def convert_language_model(
+# =============================================================================
+# Data Classes
+# =============================================================================
+
+
+@dataclass
+class ModelContext:
+    """Holds loaded model, config, and architecture information."""
+
+    model: nn.Module
+    original_model: nn.Module
+    config: object
+    arch_config: object
+    attention_classes: tuple
+    rmsnorm_classes: tuple
+    hidden_dim: int
+    model_type: str
+
+
+@dataclass
+class VerificationResult:
+    """Results from output verification."""
+
+    abs_diff_max: float
+    abs_diff_mean: float
+    abs_diff_std: float
+    rel_diff_max: float
+    rel_diff_mean: float
+    passed: bool
+
+
+# =============================================================================
+# Model Loading and Patching
+# =============================================================================
+
+
+def load_model_and_config(
     model_name: str,
-    seq_len: int = 8,
-    cache_length: int = 2048,
-    batch_size: int = 1,
     num_layers: int | None = None,
-    output_path: str | None = None,
     verbose: bool = True,
-):
-    """Convert a HuggingFace language model to CoreML.
+) -> ModelContext:
+    """Load model from HuggingFace and detect architecture.
 
     Args:
-        model_name: HuggingFace model name (e.g., "Qwen/Qwen2-0.5B").
-        seq_len: Sequence length for tracing.
-        cache_length: Maximum KV cache length.
-        batch_size: Batch size for the model.
-        num_layers: Number of transformer layers to keep. If None, use all layers.
-                    Useful for faster debugging and testing.
-        output_path: Path to save the converted model. If None, auto-generated.
-        verbose: Print detailed information during conversion.
+        model_name: HuggingFace model name.
+        num_layers: Optional layer limit for debugging.
+        verbose: Print detailed information.
 
     Returns:
-        The converted CoreML model.
+        ModelContext with loaded model and configuration.
     """
-    print("CoreML Language Model Conversion")
-    print("=" * 60)
+    if verbose:
+        print(f"Loading config: {model_name}")
 
-    # 1. Load config and detect architecture
-    print(f"\n[1] Loading config: {model_name}")
     config = AutoConfig.from_pretrained(model_name)
     model_type = config.model_type
 
-    print(f"    Model type: {model_type}")
-    print(f"    Supported architectures: {get_supported_architectures()}")
+    if verbose:
+        print(f"    Model type: {model_type}")
+        print(f"    Supported architectures: {get_supported_architectures()}")
 
-    # Get architecture-specific configuration
     arch_config = get_architecture_config(model_type)
-    print("    Architecture config:")
-    print(f"      - Attention classes: {arch_config.attention_class_names}")
-    print(f"      - RMSNorm classes: {arch_config.rmsnorm_class_names}")
-    print(f"      - Has QK-norm: {arch_config.has_qk_norm}")
+    if verbose:
+        print("    Architecture config:")
+        print(f"      - Attention classes: {arch_config.attention_class_names}")
+        print(f"      - RMSNorm classes: {arch_config.rmsnorm_class_names}")
+        print(f"      - Has QK-norm: {arch_config.has_qk_norm}")
 
-    # 2. Load model
-    print(f"\n[2] Loading model: {model_name}")
+    if verbose:
+        print(f"Loading model: {model_name}")
+
     model = AutoModel.from_pretrained(
         model_name,
         torch_dtype=torch.float32,
@@ -104,94 +138,226 @@ def convert_language_model(
     )
     model.eval()
 
-    # Optionally truncate to fewer layers for faster debugging
+    # Optionally truncate layers
     if num_layers is not None and num_layers < config.num_hidden_layers:
-        print(f"    Truncating model from {config.num_hidden_layers} to {num_layers} layers...")
+        if verbose:
+            print(f"    Truncating from {config.num_hidden_layers} to {num_layers} layers...")
         model.layers = model.layers[:num_layers]
         config.num_hidden_layers = num_layers
 
-    # Keep a copy of the original model for comparison
+    # Keep original for comparison
     original_model = copy.deepcopy(model)
     original_model.eval()
 
     hidden_dim = config.hidden_size
-    print(f"    Hidden dim: {hidden_dim}")
-    print(f"    Num layers: {config.num_hidden_layers}")
-    print(f"    Num heads: {config.num_attention_heads}")
-    print(f"    Num KV heads: {config.num_key_value_heads}")
+    if verbose:
+        print(f"    Hidden dim: {hidden_dim}")
+        print(f"    Num layers: {config.num_hidden_layers}")
+        print(f"    Num heads: {config.num_attention_heads}")
+        print(f"    Num KV heads: {config.num_key_value_heads}")
 
-    # 3. Find target classes from the loaded model
-    print("\n[3] Finding target classes...")
+    # Find target classes
+    if verbose:
+        print("Finding target classes...")
     attention_classes = find_target_classes(model, arch_config.attention_class_names)
     rmsnorm_classes = find_target_classes(model, arch_config.rmsnorm_class_names)
-    print(f"    Attention classes: {[c.__name__ for c in attention_classes]}")
-    print(f"    RMSNorm classes: {[c.__name__ for c in rmsnorm_classes]}")
+    if verbose:
+        print(f"    Attention classes: {[c.__name__ for c in attention_classes]}")
+        print(f"    RMSNorm classes: {[c.__name__ for c in rmsnorm_classes]}")
 
-    # 4. Patch Linear layers
-    print("\n[4] Patching Linear layers...")
+    return ModelContext(
+        model=model,
+        original_model=original_model,
+        config=config,
+        arch_config=arch_config,
+        attention_classes=attention_classes,
+        rmsnorm_classes=rmsnorm_classes,
+        hidden_dim=hidden_dim,
+        model_type=model_type,
+    )
+
+
+def patch_model_layers(
+    model: nn.Module,
+    attention_classes: tuple,
+    rmsnorm_classes: tuple,
+    config: object,
+    verbose: bool = True,
+    start_layer_idx: int = 0,
+) -> None:
+    """Apply all patches (Linear, RMSNorm, Attention) to a model.
+
+    Args:
+        model: Model or module to patch.
+        attention_classes: Tuple of attention class types.
+        rmsnorm_classes: Tuple of RMSNorm class types.
+        config: Model configuration.
+        verbose: Print patching info.
+        start_layer_idx: Starting layer index for attention patching.
+    """
+    if verbose:
+        print("Patching Linear layers...")
     with torch.inference_mode():
         patch_model_linears(model, verbose=verbose)
 
-    # 5. Patch RMSNorm layers (including q_norm/k_norm if present)
-    print("\n[5] Patching RMSNorm layers...")
+    if verbose:
+        print("Patching RMSNorm layers...")
     with torch.inference_mode():
-        patch_model_rmsnorms(
-            model,
-            target_classes=rmsnorm_classes,
-            verbose=verbose,
-        )
+        patch_model_rmsnorms(model, target_classes=rmsnorm_classes, verbose=verbose)
 
-    # 6. Patch attention layers
-    print("\n[6] Patching attention layers...")
+    if verbose:
+        print("Patching attention layers...")
     with torch.inference_mode():
         patch_model_attention(
             model,
             target_classes=attention_classes,
             config=config,
             verbose=verbose,
+            start_layer_idx=start_layer_idx,
         )
 
-    # 7. Wrap model for CoreML conversion
-    print("\n[7] Creating LanguageModelWrapper...")
-    with torch.inference_mode():
-        wrapped_model = LanguageModelWrapper(
-            model,
-            cache_length=cache_length,
-            channels_first=True,
-            device="cpu",
-        )
-        wrapped_model.eval()
-    print(f"    {wrapped_model}")
 
-    # 8. Prepare example inputs for tracing
-    print("\n[8] Preparing example inputs...")
-    # Channels-first format: (batch, hidden_dim, 1, seq_len)
-    example_inputs = (
-        torch.randn((batch_size, hidden_dim, 1, seq_len), dtype=torch.float32),
-        torch.zeros((1,), dtype=torch.int32),  # position_id
+# =============================================================================
+# Verification Utilities
+# =============================================================================
+
+
+def compute_output_differences(
+    pytorch_output: np.ndarray,
+    coreml_output: np.ndarray,
+    abs_threshold: float = 0.1,
+    rel_threshold: float = 0.1,
+) -> VerificationResult:
+    """Compute difference statistics between PyTorch and CoreML outputs.
+
+    Args:
+        pytorch_output: Output from PyTorch model.
+        coreml_output: Output from CoreML model.
+        abs_threshold: Max absolute difference threshold for pass.
+        rel_threshold: Mean relative difference threshold for pass.
+
+    Returns:
+        VerificationResult with statistics and pass/fail status.
+    """
+    abs_diff = np.abs(pytorch_output - coreml_output)
+    rel_diff = abs_diff / (np.abs(pytorch_output) + 1e-7)
+
+    return VerificationResult(
+        abs_diff_max=float(abs_diff.max()),
+        abs_diff_mean=float(abs_diff.mean()),
+        abs_diff_std=float(abs_diff.std()),
+        rel_diff_max=float(rel_diff.max()),
+        rel_diff_mean=float(rel_diff.mean()),
+        passed=abs_diff.max() < abs_threshold and rel_diff.mean() < rel_threshold,
     )
-    print(f"    Input shape: {example_inputs[0].shape}")
-    print(f"    Position ID shape: {example_inputs[1].shape}")
 
-    # 9. Trace the model
-    print("\n[9] Tracing model with torch.jit.trace...")
+
+def print_verification_result(
+    result: VerificationResult,
+    pytorch_output: np.ndarray,
+    coreml_output: np.ndarray,
+    label: str = "",
+    indent: str = "    ",
+) -> None:
+    """Print verification statistics."""
+    if label:
+        print(f"{indent}{label}")
+
+    print(f"{indent}Absolute difference:")
+    print(f"{indent}  Max:  {result.abs_diff_max:.6f}")
+    print(f"{indent}  Mean: {result.abs_diff_mean:.6f}")
+    print(f"{indent}  Std:  {result.abs_diff_std:.6f}")
+
+    print(f"{indent}Relative difference:")
+    print(f"{indent}  Max:  {result.rel_diff_max:.6f}")
+    print(f"{indent}  Mean: {result.rel_diff_mean:.6f}")
+
+    print(f"{indent}PyTorch sample: {pytorch_output.flatten()[:5]}")
+    print(f"{indent}CoreML sample:  {coreml_output.flatten()[:5]}")
+
+    if result.passed:
+        print(f"{indent}[OK] Outputs match within tolerance!")
+    else:
+        print(f"{indent}[WARNING] Outputs differ significantly")
+
+
+def run_original_model(
+    original_model: nn.Module,
+    test_input_sf: torch.Tensor,
+    seq_len: int,
+) -> np.ndarray:
+    """Run original PyTorch model and return channels-first output."""
     with torch.inference_mode():
-        traced_model = torch.jit.trace(wrapped_model, example_inputs)
-    print("    Tracing complete!")
+        output = original_model(
+            inputs_embeds=test_input_sf,
+            position_ids=torch.arange(seq_len).unsqueeze(0),
+        )
+        return output.last_hidden_state.transpose(1, 2).unsqueeze(2).numpy()
 
-    # 10. Convert to CoreML
-    print("\n[10] Converting to CoreML...")
 
-    # Register extended graph passes to support LayerNorm fusion on any axis
-    # (required for QK-norm patterns which use axis=2)
-    register_extended_passes()
+def run_coreml_model(
+    mlmodel,
+    test_input_cf: np.ndarray,
+    position_id: int,
+    state,
+    input_name: str = "inputs_embeds",
+) -> np.ndarray:
+    """Run CoreML model and return output."""
+    result = mlmodel.predict(
+        {input_name: test_input_cf, "position_id": np.array([position_id], dtype=np.int32)},
+        state,
+    )
+    return result["output"]
 
-    mlmodel = ct.convert(
+
+def create_test_inputs(
+    batch_size: int,
+    hidden_dim: int,
+    seq_len: int,
+) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor]:
+    """Create test inputs in both formats.
+
+    Returns:
+        Tuple of (channels_first_numpy, channels_first_tensor, sequence_first_tensor)
+    """
+    test_input_cf = np.random.randn(batch_size, hidden_dim, 1, seq_len).astype(np.float32)
+    test_input_tensor = torch.from_numpy(test_input_cf)
+    test_input_sf = test_input_tensor.squeeze(2).transpose(1, 2)
+    return test_input_cf, test_input_tensor, test_input_sf
+
+
+# =============================================================================
+# CoreML Conversion
+# =============================================================================
+
+
+def convert_to_coreml(
+    traced_model,
+    batch_size: int,
+    hidden_dim: int,
+    seq_len: int,
+    state_specs: list,
+    input_name: str = "inputs_embeds",
+):
+    """Convert traced model to CoreML.
+
+    Args:
+        traced_model: Traced PyTorch model.
+        batch_size: Batch size.
+        hidden_dim: Hidden dimension.
+        seq_len: Sequence length.
+        state_specs: CoreML state specifications.
+        input_name: Name for the input tensor.
+
+    Returns:
+        Converted CoreML model.
+    """
+    return ct.convert(
         traced_model,
         inputs=[
             ct.TensorType(
                 shape=(batch_size, hidden_dim, 1, seq_len),
-                name="inputs_embeds",
+                name=input_name,
             ),
             ct.TensorType(
                 shape=(1,),
@@ -202,113 +368,473 @@ def convert_language_model(
         outputs=[
             ct.TensorType(name="output"),
         ],
-        states=create_coreml_state_specs(wrapped_model),
+        states=state_specs,
         compute_precision=ct.precision.FLOAT16,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
         minimum_deployment_target=ct.target.iOS18,
     )
 
-    # 11. Save model
+
+def run_model_analysis(
+    mlmodel,
+    run_compute_plan: bool = False,
+    run_mil_inspection: bool = False,
+) -> None:
+    """Run optional model analysis."""
+    if run_compute_plan:
+        print("\nCompute Plan Analysis")
+        print("Looking for Neural Engine scheduling...")
+        analyze_compute_plan(mlmodel)
+
+    if run_mil_inspection:
+        print("\nMIL Program Inspection")
+        print("Looking for conv, layer_norm operations...")
+        inspect_mil_program(mlmodel)
+
+
+# =============================================================================
+# Single Model Conversion
+# =============================================================================
+
+
+def convert_language_model(
+    model_name: str,
+    seq_len: int = 8,
+    cache_length: int = 2048,
+    batch_size: int = 1,
+    num_layers: int | None = None,
+    output_path: str | None = None,
+    verbose: bool = True,
+    analyze_compute: bool = False,
+    analyze_mil: bool = False,
+):
+    """Convert a HuggingFace language model to CoreML.
+
+    Args:
+        model_name: HuggingFace model name.
+        seq_len: Sequence length for tracing.
+        cache_length: Maximum KV cache length.
+        batch_size: Batch size.
+        num_layers: Number of layers to keep (for debugging).
+        output_path: Output path for CoreML model.
+        verbose: Print detailed information.
+        analyze_compute: Run compute plan analysis.
+        analyze_mil: Run MIL program inspection.
+
+    Returns:
+        Converted CoreML model.
+    """
+    print("CoreML Language Model Conversion")
+    print("=" * 60)
+
+    # Load model
+    print("\n[1] Loading model and config...")
+    ctx = load_model_and_config(model_name, num_layers, verbose)
+
+    # Patch layers
+    print("\n[2] Patching model layers...")
+    patch_model_layers(
+        ctx.model,
+        ctx.attention_classes,
+        ctx.rmsnorm_classes,
+        ctx.config,
+        verbose,
+    )
+
+    # Wrap model
+    print("\n[3] Creating LanguageModelWrapper...")
+    with torch.inference_mode():
+        wrapped_model = LanguageModelWrapper(
+            ctx.model,
+            cache_length=cache_length,
+            channels_first=True,
+            device="cpu",
+        )
+        wrapped_model.eval()
+    print(f"    {wrapped_model}")
+
+    # Trace model
+    print("\n[4] Tracing model...")
+    example_inputs = (
+        torch.randn((batch_size, ctx.hidden_dim, 1, seq_len), dtype=torch.float32),
+        torch.zeros((1,), dtype=torch.int32),
+    )
+    with torch.inference_mode():
+        traced_model = torch.jit.trace(wrapped_model, example_inputs)
+    print("    Tracing complete!")
+
+    # Convert to CoreML
+    print("\n[5] Converting to CoreML...")
+    register_extended_passes()
+
+    mlmodel = convert_to_coreml(
+        traced_model,
+        batch_size,
+        ctx.hidden_dim,
+        seq_len,
+        create_coreml_state_specs(wrapped_model),
+        input_name="inputs_embeds",
+    )
+
+    # Save model
     if output_path is None:
-        # Generate output path from model name
         model_short_name = model_name.split("/")[-1].lower().replace("-", "_")
         output_path = f"{model_short_name}_seqlen_{seq_len}.mlpackage"
 
     mlmodel.save(output_path)
     print(f"    Saved to: {output_path}")
 
-    # 12. Compare PyTorch and CoreML outputs
-    print("\n[11] Comparing PyTorch vs CoreML outputs...")
+    # Verification
+    print("\n[6] Verifying outputs...")
+    test_input_cf, _, test_input_sf = create_test_inputs(batch_size, ctx.hidden_dim, seq_len)
 
-    # Create test input in channels-first format: (batch, hidden_dim, 1, seq_len)
-    test_input_cf = np.random.randn(batch_size, hidden_dim, 1, seq_len).astype(
-        np.float32
-    )
-    test_input_tensor = torch.from_numpy(test_input_cf)
-
-    # Convert to sequence-first format for original model: (batch, seq_len, hidden_dim)
-    test_input_sf = test_input_tensor.squeeze(2).transpose(1, 2)
-
-    # Run original PyTorch model
-    with torch.inference_mode():
-        original_output = original_model(
-            inputs_embeds=test_input_sf,
-            position_ids=torch.arange(seq_len).unsqueeze(0),
-        )
-
-        # Convert to channels-first for comparison
-        pytorch_output = (
-            original_output.last_hidden_state.transpose(1, 2).unsqueeze(2).numpy()
-        )
-
-    # Run CoreML model
+    pytorch_output = run_original_model(ctx.original_model, test_input_sf, seq_len)
     state = mlmodel.make_state()
-    coreml_result = mlmodel.predict(
-        {"inputs_embeds": test_input_cf, "position_id": np.array([0], dtype=np.int32)},
-        state,
-    )
-    coreml_output = coreml_result["output"]
+    coreml_output = run_coreml_model(mlmodel, test_input_cf, 0, state)
 
-    # Compare outputs
     print(f"    PyTorch output shape: {pytorch_output.shape}")
     print(f"    CoreML output shape: {coreml_output.shape}")
 
-    # Compute differences
-    abs_diff = np.abs(pytorch_output - coreml_output)
-    rel_diff = abs_diff / (np.abs(pytorch_output) + 1e-7)
+    result = compute_output_differences(pytorch_output, coreml_output)
+    print_verification_result(result, pytorch_output, coreml_output, indent="    ")
 
-    print("\n    Absolute difference statistics:")
-    print(f"      Max:  {abs_diff.max():.6f}")
-    print(f"      Mean: {abs_diff.mean():.6f}")
-    print(f"      Std:  {abs_diff.std():.6f}")
+    # Test stateful inference
+    print("\n[7] Testing stateful inference (second forward pass)...")
+    output2 = run_coreml_model(mlmodel, test_input_cf, seq_len, state)
+    print(f"    Second output shape: {output2.shape}")
+    print(f"    Second output sample: {output2.flatten()[:5]}")
 
-    print("\n    Relative difference statistics:")
-    print(f"      Max:  {rel_diff.max():.6f}")
-    print(f"      Mean: {rel_diff.mean():.6f}")
+    # Optional analysis
+    run_model_analysis(mlmodel, analyze_compute, analyze_mil)
 
-    # Sample outputs for visual comparison
-    print(f"\n    PyTorch sample: {pytorch_output.flatten()[:5]}")
-    print(f"    CoreML sample:  {coreml_output.flatten()[:5]}")
-
-    # Check if outputs are close (FP16 tolerance)
-    if abs_diff.max() < 0.1 and rel_diff.mean() < 0.1:
-        print("\n    [OK] Outputs match within FP16 tolerance!")
-    else:
-        print("\n    [WARNING] Outputs differ significantly - check implementation")
-
-    # 13. Test stateful inference (second forward pass)
-    print("\n[12] Testing stateful inference (second forward pass)...")
-    output2 = mlmodel.predict(
-        {
-            "inputs_embeds": test_input_cf,
-            "position_id": np.array([seq_len], dtype=np.int32),
-        },
-        state,
-    )
-    print(f"    Second output shape: {output2['output'].shape}")
-    print(f"    Second output sample: {output2['output'].flatten()[:5]}")
-
-    # 14. Analyze compute plan
-    print("\n[13] Compute Plan Analysis")
-    print("     Looking for Neural Engine scheduling...")
-    analyze_compute_plan(mlmodel)
-
-    # 15. Inspect MIL program
-    print("\n[14] MIL Program Inspection")
-    print("     Looking for conv, layer_norm operations...")
-    inspect_mil_program(mlmodel)
-
+    # Summary
     print("\n" + "=" * 60)
     print("Conversion complete!")
     print(f"Model saved to: {output_path}")
-    print(f"Architecture: {model_type}")
-    print(f"QK-norm enabled: {arch_config.has_qk_norm}")
-    print("\nExpected MIL operations:")
-    print("  - conv (from Linear patching)")
-    print("  - layer_norm (from RMSNorm fusion)")
-    print("  - read_state/coreml_update_state (from KV cache)")
+    print(f"Architecture: {ctx.model_type}")
+    print(f"QK-norm enabled: {ctx.arch_config.has_qk_norm}")
 
     return mlmodel
+
+
+# =============================================================================
+# Chunked Model Conversion
+# =============================================================================
+
+
+def calculate_chunk_ranges(total_layers: int, num_chunks: int) -> list:
+    """Calculate layer ranges for each chunk.
+
+    Returns:
+        List of (start, end) tuples for each chunk.
+    """
+    layers_per_chunk = math.ceil(total_layers / num_chunks)
+    chunk_ranges = []
+    for i in range(num_chunks):
+        start = i * layers_per_chunk
+        end = min((i + 1) * layers_per_chunk, total_layers)
+        if start < total_layers:
+            chunk_ranges.append((start, end))
+    return chunk_ranges
+
+
+def convert_single_chunk(
+    chunk_idx: int,
+    start_layer: int,
+    end_layer: int,
+    model: nn.Module,
+    config: object,
+    attention_classes: tuple,
+    rmsnorm_classes: tuple,
+    cache_length: int,
+    cos_emb: torch.Tensor,
+    sin_emb: torch.Tensor,
+    batch_size: int,
+    hidden_dim: int,
+    seq_len: int,
+    is_last_chunk: bool,
+    output_path: Path,
+):
+    """Convert a single chunk to CoreML.
+
+    Returns:
+        Tuple of (chunk_mlmodel, chunk_wrapper).
+    """
+    print(f"\n    --- Chunk {chunk_idx} (layers {start_layer}-{end_layer-1}) ---")
+
+    # Extract and copy layers
+    chunk_layers = [copy.deepcopy(layer) for layer in model.layers[start_layer:end_layer]]
+    chunk_module = nn.ModuleList(chunk_layers)
+
+    # Patch layers
+    print("    Patching layers...")
+    patch_model_layers(
+        chunk_module,
+        attention_classes,
+        rmsnorm_classes,
+        config,
+        verbose=False,
+        start_layer_idx=0,
+    )
+
+    # Get final norm for last chunk
+    final_norm = None
+    if is_last_chunk:
+        original_norm = copy.deepcopy(model.norm)
+        # Directly wrap the final norm with patcher (patch_model_rmsnorms only patches children)
+        if isinstance(original_norm, rmsnorm_classes):
+            final_norm = RMSNormToLayerNormPatcher(original_norm)
+        else:
+            final_norm = original_norm
+
+    # Create wrapper
+    print("    Creating ChunkedLanguageModelWrapper...")
+    with torch.inference_mode():
+        chunk_wrapper = ChunkedLanguageModelWrapper(
+            layers=list(chunk_module),
+            config=config,
+            chunk_idx=chunk_idx,
+            cache_length=cache_length,
+            cos_emb=cos_emb,
+            sin_emb=sin_emb,
+            channels_first=True,
+            is_first_chunk=(chunk_idx == 0),
+            is_last_chunk=is_last_chunk,
+            final_norm=final_norm,
+            device="cpu",
+        )
+        chunk_wrapper.eval()
+    print(f"    {chunk_wrapper}")
+
+    # Trace
+    print("    Tracing chunk...")
+    example_inputs = (
+        torch.randn((batch_size, hidden_dim, 1, seq_len), dtype=torch.float32),
+        torch.zeros((1,), dtype=torch.int32),
+    )
+    with torch.inference_mode():
+        traced_chunk = torch.jit.trace(chunk_wrapper, example_inputs)
+
+    # Convert
+    print("    Converting to CoreML...")
+    chunk_mlmodel = convert_to_coreml(
+        traced_chunk,
+        batch_size,
+        hidden_dim,
+        seq_len,
+        create_chunked_coreml_state_specs(chunk_wrapper),
+        input_name="hidden_states",
+    )
+
+    # Save
+    chunk_path = output_path / f"chunk_{chunk_idx}.mlpackage"
+    chunk_mlmodel.save(str(chunk_path))
+    print(f"    Saved to: {chunk_path}")
+
+    return chunk_mlmodel, chunk_wrapper
+
+
+def verify_chunked_model(
+    chunk_models: list,
+    chunk_ranges: list,
+    original_model: nn.Module,
+    batch_size: int,
+    hidden_dim: int,
+    seq_len: int,
+) -> VerificationResult:
+    """Verify chunked model outputs against original.
+
+    This performs end-to-end verification by:
+    1. Running the original unpatched PyTorch model with sequence-first input
+    2. Chaining all CoreML chunks together with channels-first input
+    3. Comparing the final outputs (both converted to channels-first format)
+
+    Both paths start from the same random test data, ensuring a fair comparison.
+
+    Returns:
+        VerificationResult with comparison statistics.
+    """
+    test_input_cf, _, test_input_sf = create_test_inputs(batch_size, hidden_dim, seq_len)
+
+    # End-to-end verification: compare full original model vs chained CoreML chunks
+    print("\n    End-to-end verification (Original PyTorch vs Chained CoreML Chunks)...")
+
+    # Path 1: Run original unpatched PyTorch model
+    # Input: sequence-first (batch, seq_len, hidden_dim)
+    # Output: converted to channels-first (batch, hidden_dim, 1, seq_len)
+    pytorch_output = run_original_model(original_model, test_input_sf, seq_len)
+
+    # Path 2: Chain all CoreML chunks together
+    # Input/Output: channels-first (batch, hidden_dim, 1, seq_len)
+    chunk_states = [model.make_state() for model in chunk_models]
+    current_hidden = test_input_cf
+
+    for chunk_idx, (chunk_model, chunk_state) in enumerate(zip(chunk_models, chunk_states)):
+        result = chunk_model.predict(
+            {"hidden_states": current_hidden, "position_id": np.array([0], dtype=np.int32)},
+            chunk_state,
+        )
+        current_hidden = result["output"]
+
+    chained_output = current_hidden
+
+    print(f"    PyTorch output shape: {pytorch_output.shape}")
+    print(f"    Chained CoreML output shape: {chained_output.shape}")
+
+    e2e_result = compute_output_differences(pytorch_output, chained_output, 0.5, 0.2)
+    print_verification_result(e2e_result, pytorch_output, chained_output, indent="    ")
+
+    # Test stateful inference (second forward pass to verify KV cache works)
+    print("\n    Testing stateful inference (second forward pass across all chunks)...")
+    current_hidden = test_input_cf
+    for chunk_model, chunk_state in zip(chunk_models, chunk_states):
+        result = chunk_model.predict(
+            {"hidden_states": current_hidden, "position_id": np.array([seq_len], dtype=np.int32)},
+            chunk_state,
+        )
+        current_hidden = result["output"]
+
+    print(f"    Second pass output shape: {current_hidden.shape}")
+    print(f"    Second pass output sample: {current_hidden.flatten()[:5]}")
+
+    return e2e_result
+
+
+def convert_chunked_language_model(
+    model_name: str,
+    num_chunks: int,
+    seq_len: int = 8,
+    cache_length: int = 2048,
+    batch_size: int = 1,
+    num_layers: int | None = None,
+    output_dir: str | None = None,
+    verbose: bool = True,
+    analyze_compute: bool = False,
+    analyze_mil: bool = False,
+):
+    """Convert a HuggingFace language model to multiple CoreML chunks.
+
+    Args:
+        model_name: HuggingFace model name.
+        num_chunks: Number of chunks to split the model into.
+        seq_len: Sequence length for tracing.
+        cache_length: Maximum KV cache length.
+        batch_size: Batch size.
+        num_layers: Number of layers to keep (for debugging).
+        output_dir: Directory for output chunks.
+        verbose: Print detailed information.
+        analyze_compute: Run compute plan analysis on each chunk.
+        analyze_mil: Run MIL program inspection on each chunk.
+
+    Returns:
+        List of converted CoreML models.
+    """
+    print("CoreML Chunked Language Model Conversion")
+    print("=" * 60)
+    print(f"Splitting model into {num_chunks} chunks")
+
+    # Load model
+    print("\n[1] Loading model and config...")
+    ctx = load_model_and_config(model_name, num_layers, verbose)
+
+    total_layers = ctx.config.num_hidden_layers
+
+    # Calculate chunk distribution
+    print("\n[2] Calculating layer distribution...")
+    chunk_ranges = calculate_chunk_ranges(total_layers, num_chunks)
+
+    actual_num_chunks = len(chunk_ranges)
+    if actual_num_chunks != num_chunks:
+        print(f"    Note: Adjusted to {actual_num_chunks} chunks")
+        num_chunks = actual_num_chunks
+
+    for i, (start, end) in enumerate(chunk_ranges):
+        print(f"    Chunk {i}: layers {start}-{end-1} ({end - start} layers)")
+
+    # Pre-compute position embeddings
+    print("\n[3] Pre-computing position embeddings...")
+    position_ids = torch.arange(cache_length, dtype=torch.long).unsqueeze(0)
+    dummy_values = torch.ones(1, dtype=torch.float32)
+    cos_emb, sin_emb = ctx.model.rotary_emb(dummy_values, position_ids)
+    cos_emb = cos_emb[0]
+    sin_emb = sin_emb[0]
+    print(f"    Position embedding shape: {cos_emb.shape}")
+
+    # Register graph passes
+    register_extended_passes()
+
+    # Setup output directory
+    if output_dir is None:
+        model_short_name = model_name.split("/")[-1].lower().replace("-", "_")
+        output_dir = f"{model_short_name}_chunked_{num_chunks}"
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Convert each chunk
+    print(f"\n[4] Converting {num_chunks} chunks...")
+    chunk_models = []
+
+    for chunk_idx, (start_layer, end_layer) in enumerate(chunk_ranges):
+        is_last_chunk = (chunk_idx == num_chunks - 1)
+
+        chunk_mlmodel, _ = convert_single_chunk(
+            chunk_idx,
+            start_layer,
+            end_layer,
+            ctx.model,
+            ctx.config,
+            ctx.attention_classes,
+            ctx.rmsnorm_classes,
+            cache_length,
+            cos_emb,
+            sin_emb,
+            batch_size,
+            ctx.hidden_dim,
+            seq_len,
+            is_last_chunk,
+            output_path,
+        )
+        chunk_models.append(chunk_mlmodel)
+
+        # Optional analysis per chunk
+        if analyze_compute or analyze_mil:
+            print(f"\n    Analyzing chunk {chunk_idx}...")
+            run_model_analysis(chunk_mlmodel, analyze_compute, analyze_mil)
+
+    # Verification
+    print("\n" + "=" * 60)
+    print("[5] VERIFICATION")
+    print("=" * 60)
+
+    e2e_result = verify_chunked_model(
+        chunk_models,
+        chunk_ranges,
+        ctx.original_model,
+        batch_size,
+        ctx.hidden_dim,
+        seq_len,
+    )
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("CONVERSION SUMMARY")
+    print("=" * 60)
+    print(f"Model: {model_name}")
+    print(f"Architecture: {ctx.model_type}")
+    print(f"Total layers: {total_layers}")
+    print(f"Number of chunks: {num_chunks}")
+    print(f"Output directory: {output_dir}")
+    print("\nChunk files:")
+    for i in range(num_chunks):
+        print(f"  - chunk_{i}.mlpackage")
+    print(f"\nEnd-to-end verification: {'PASSED' if e2e_result.passed else 'FAILED'}")
+
+    return chunk_models
+
+
+# =============================================================================
+# CLI Entry Point
+# =============================================================================
 
 
 def main():
@@ -317,17 +843,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Convert Qwen2 model (default)
+    # Convert Qwen2 model (default, single model)
     python examples/lm_conversion_example.py
 
-    # Convert Qwen3 model
+    # Convert Qwen3 model (single model)
     python examples/lm_conversion_example.py --model Qwen/Qwen3-0.6B
 
-    # Quick debug with only 2 layers
-    python examples/lm_conversion_example.py --num-layers 2
+    # Convert large model in 4 chunks (for models > 2GB)
+    python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4
 
-    # Custom settings
-    python examples/lm_conversion_example.py --model Qwen/Qwen2-0.5B --seq-len 16 --cache-length 4096
+    # Quick debug with only 8 layers split into 2 chunks
+    python examples/lm_conversion_example.py --num-layers 8 --num-chunks 2
+
+    # With analysis enabled
+    python examples/lm_conversion_example.py --analyze-compute-plan --analyze-mil
         """,
     )
     parser.add_argument(
@@ -355,27 +884,60 @@ Examples:
         help="Number of transformer layers to keep (default: all). Useful for faster debugging.",
     )
     parser.add_argument(
+        "--num-chunks",
+        type=int,
+        default=1,
+        help="Number of chunks to split the model into (default: 1, no chunking). "
+        "Use for large models (>2GB) that exceed Neural Engine limits.",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Output path for the CoreML model (default: auto-generated)",
+        help="Output path for the CoreML model (default: auto-generated). "
+        "For chunked models, this is the output directory.",
     )
     parser.add_argument(
         "--quiet",
         action="store_true",
         help="Reduce verbosity",
     )
+    parser.add_argument(
+        "--analyze-compute-plan",
+        action="store_true",
+        help="Run compute plan analysis to check Neural Engine scheduling",
+    )
+    parser.add_argument(
+        "--analyze-mil",
+        action="store_true",
+        help="Run MIL program inspection to check for conv, layer_norm operations",
+    )
 
     args = parser.parse_args()
 
-    convert_language_model(
-        model_name=args.model,
-        seq_len=args.seq_len,
-        cache_length=args.cache_length,
-        num_layers=args.num_layers,
-        output_path=args.output,
-        verbose=not args.quiet,
-    )
+    if args.num_chunks > 1:
+        convert_chunked_language_model(
+            model_name=args.model,
+            num_chunks=args.num_chunks,
+            seq_len=args.seq_len,
+            cache_length=args.cache_length,
+            num_layers=args.num_layers,
+            output_dir=args.output,
+            verbose=not args.quiet,
+            analyze_compute=args.analyze_compute_plan,
+            analyze_mil=args.analyze_mil,
+        )
+    else:
+        convert_language_model(
+            model_name=args.model,
+            seq_len=args.seq_len,
+            cache_length=args.cache_length,
+            num_layers=args.num_layers,
+            output_path=args.output,
+            verbose=not args.quiet,
+            analyze_compute=args.analyze_compute_plan,
+            analyze_mil=args.analyze_mil,
+        )
 
 
 if __name__ == "__main__":
