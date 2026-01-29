@@ -12,6 +12,11 @@ The script supports two modes:
 2. Chunked conversion: Splits the model into N chunks for large models (>2GB)
    that exceed the Neural Engine limit
 
+Additional exports:
+- Embeddings: Export embedding weights as .npy file (float16)
+- LM Head: Export language model head as CoreML with vocabulary chunking for
+  Neural Engine compatibility (handles weight dimension limit of ~16384)
+
 Usage:
     # Convert Qwen2 model (single)
     uv run python examples/lm_conversion_example.py
@@ -21,6 +26,15 @@ Usage:
 
     # Convert large model in 4 chunks (for models > 2GB)
     uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4
+
+    # Export embeddings and LM head (with model conversion)
+    uv run python examples/lm_conversion_example.py --export-embeddings --export-lm-head
+
+    # Export ONLY embeddings and LM head (skip model conversion for faster development)
+    uv run python examples/lm_conversion_example.py --export-embeddings --export-lm-head --components-only
+
+    # Export LM head with custom chunk size
+    uv run python examples/lm_conversion_example.py --export-lm-head --lm-head-chunk-size 8192
 
     # Quick debug with only 2 layers
     uv run python examples/lm_conversion_example.py --num-layers 2
@@ -40,13 +54,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import coremltools as ct
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 from coremlmodels import (
     analyze_compute_plan,
+    ChunkedLanguageModelWrapper,
+    convert_lm_head,
     create_coreml_state_specs,
     create_chunked_coreml_state_specs,
-    ChunkedLanguageModelWrapper,
+    export_embeddings,
     find_target_classes,
     get_architecture_config,
     get_supported_architectures,
@@ -855,6 +871,9 @@ Examples:
     # Quick debug with only 8 layers split into 2 chunks
     python examples/lm_conversion_example.py --num-layers 8 --num-chunks 2
 
+    # Export only embeddings and LM head (skip model conversion for faster development)
+    python examples/lm_conversion_example.py --export-embeddings --export-lm-head --components-only
+
     # With analysis enabled
     python examples/lm_conversion_example.py --analyze-compute-plan --analyze-mil
         """,
@@ -912,10 +931,43 @@ Examples:
         action="store_true",
         help="Run MIL program inspection to check for conv, layer_norm operations",
     )
+    parser.add_argument(
+        "--export-embeddings",
+        action="store_true",
+        help="Export embedding weights as .npy file in float16 format",
+    )
+    parser.add_argument(
+        "--export-lm-head",
+        action="store_true",
+        help="Export LM head as CoreML model with vocabulary chunking for Neural Engine compatibility",
+    )
+    parser.add_argument(
+        "--lm-head-chunk-size",
+        type=int,
+        default=6144,
+        help="Chunk size for LM head vocabulary dimension (default: 6144). "
+        "Smaller values use less memory but create more chunks.",
+    )
+    parser.add_argument(
+        "--lm-head-no-logsumexp",
+        action="store_true",
+        help="Disable log-sum-exp computation in LM head (only output logits)",
+    )
+    parser.add_argument(
+        "--components-only",
+        action="store_true",
+        help="Skip main model conversion and only export embeddings/LM head. "
+        "Must be used with --export-embeddings and/or --export-lm-head.",
+    )
 
     args = parser.parse_args()
 
-    if args.num_chunks > 1:
+    # Validate arguments
+    if args.components_only and not (args.export_embeddings or args.export_lm_head):
+        parser.error("--components-only requires --export-embeddings and/or --export-lm-head")
+
+    # Convert main model (unless components-only mode)
+    if not args.components_only and args.num_chunks > 1:
         convert_chunked_language_model(
             model_name=args.model,
             num_chunks=args.num_chunks,
@@ -927,7 +979,7 @@ Examples:
             analyze_compute=args.analyze_compute_plan,
             analyze_mil=args.analyze_mil,
         )
-    else:
+    elif not args.components_only:
         convert_language_model(
             model_name=args.model,
             seq_len=args.seq_len,
@@ -938,6 +990,96 @@ Examples:
             analyze_compute=args.analyze_compute_plan,
             analyze_mil=args.analyze_mil,
         )
+
+    # Export embeddings and/or LM head if requested
+    if args.export_embeddings or args.export_lm_head:
+        print("\n" + "=" * 60)
+        print("EXPORTING ADDITIONAL COMPONENTS")
+        print("=" * 60)
+
+        # Load model if needed (for embeddings/LM head export)
+        if not args.quiet:
+            print(f"\nLoading model: {args.model}")
+        config = AutoConfig.from_pretrained(args.model)
+        model = AutoModel.from_pretrained(
+            args.model,
+            torch_dtype=torch.float32,
+            device_map="cpu",
+        )
+        model.eval()
+
+        # Optionally truncate layers (for consistency with main conversion)
+        if args.num_layers is not None and args.num_layers < config.num_hidden_layers:
+            if not args.quiet:
+                print(f"Truncating from {config.num_hidden_layers} to {args.num_layers} layers...")
+            model.layers = model.layers[:args.num_layers]
+            config.num_hidden_layers = args.num_layers
+
+        # Determine output directory
+        if args.output:
+            if args.num_chunks > 1:
+                output_dir = Path(args.output)
+            else:
+                output_dir = Path(args.output).parent
+        else:
+            model_short_name = args.model.split("/")[-1].lower().replace("-", "_")
+            if args.num_chunks > 1:
+                output_dir = Path(f"{model_short_name}_chunked_{args.num_chunks}")
+            else:
+                output_dir = Path(".")
+
+        # Export embeddings
+        if args.export_embeddings:
+            print("\n[1] Exporting embeddings...")
+            embeddings_path = output_dir / "embeddings.npy"
+            export_embeddings(model, embeddings_path, verbose=not args.quiet)
+
+        # Export LM head
+        if args.export_lm_head:
+            print("\n[2] Exporting LM head...")
+            lm_head_path = output_dir / "lm_head.mlpackage"
+
+            # Load causal LM model to get lm_head
+            if not args.quiet:
+                print("  Loading causal LM model for lm_head...")
+
+            try:
+                causal_model = AutoModelForCausalLM.from_pretrained(
+                    args.model,
+                    torch_dtype=torch.float32,
+                    device_map="cpu",
+                )
+                causal_model.eval()
+
+                if hasattr(causal_model, "lm_head"):
+                    lm_head = causal_model.lm_head
+                else:
+                    print("  [WARNING] Could not find lm_head in model. Skipping LM head export.")
+                    lm_head = None
+
+                if lm_head is not None:
+                    convert_lm_head(
+                        lm_head=lm_head,
+                        batch_size=1,
+                        hidden_dim=config.hidden_size,
+                        seq_len=args.seq_len,
+                        output_path=lm_head_path,
+                        chunk_size=args.lm_head_chunk_size,
+                        compute_logsumexp=not args.lm_head_no_logsumexp,
+                        verbose=not args.quiet,
+                        analyze_compute=args.analyze_compute_plan,
+                        analyze_mil=args.analyze_mil,
+                    )
+            except Exception as e:
+                print(f"  [ERROR] Failed to load or convert LM head: {e}")
+
+        print("\n" + "=" * 60)
+        print("EXPORT COMPLETE")
+        print("=" * 60)
+        if args.export_embeddings:
+            print(f"Embeddings: {output_dir / 'embeddings.npy'}")
+        if args.export_lm_head:
+            print(f"LM head: {output_dir / 'lm_head.mlpackage'}")
 
 
 if __name__ == "__main__":

@@ -10,7 +10,9 @@
 2. **Patch RMSNorm layers** - Trick to mitigate ANE's FP16 accumulation issues with RMSNorm's `sqrt(mean(x²))`
 3. **Patch Attention layers** - Channels-first GQA with CoreML state for KV cache, supports QK-norm (Qwen3-style)
 4. **Language Model Wrapper** - Full LM conversion with pre-computed position embeddings and stateful KV cache
-5. **Architecture Registry** - Auto-detection of model architecture for appropriate patching configuration
+5. **Chunked LM Head** - Vocabulary chunking to handle ANE's weight dimension limit (~16384) with temperature scaling
+6. **Embeddings Export** - Export embedding weights as .npy files in float16 format
+7. **Architecture Registry** - Auto-detection of model architecture for appropriate patching configuration
 
 ## Repository navigation instructions
 
@@ -35,6 +37,10 @@ uv run python examples/rmsnorm_conversion_example.py
 uv run python examples/lm_conversion_example.py                    # Qwen2 (default)
 uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-0.6B  # Qwen3 with QK-norm
 uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4  # Large model chunked
+
+# Export embeddings and LM head separately
+uv run python examples/export_embeddings_lmhead.py                 # Export both
+uv run python examples/lm_conversion_example.py --export-embeddings --export-lm-head --components-only
 
 # Lint code
 uv run ruff check .
@@ -619,6 +625,8 @@ ios16.conv           | input_cast_fp16                | NeuralEngine    | 1.73e-
 | `patch_rmsnorm.py` | `RMSNormToLayerNormPatcher`, `patch_model_rmsnorms` | RMSNorm -> LayerNorm ops (axis-aware) |
 | `patch_attention.py` | `AttentionPatcher`, `patch_model_attention` | Attention -> ANE-optimized channels-first with QK-norm |
 | `lm_model_wrapper.py` | `LanguageModelWrapper`, `ChunkedLanguageModelWrapper`, `create_coreml_state_specs` | LM wrappers with KV cache state (full and chunked) |
+| `chunked_lm_head.py` | `ChunkedLMHead` | Vocabulary-chunked LM head with temperature scaling |
+| `export_utils.py` | `export_embeddings`, `convert_lm_head` | Export embeddings and LM head to CoreML |
 | `registry.py` | `ArchitectureConfig`, `get_architecture_config`, `find_target_classes` | Architecture auto-detection |
 | `graph_passes.py` | `fuse_layernorm_or_instancenorm`, `register_extended_passes` | Extended CoreMLTools graph passes |
 | `analysis.py` | `analyze_compute_plan`, `inspect_mil_program` | CoreML verification tools |
@@ -707,6 +715,82 @@ uv run python examples/lm_conversion_example.py --num-layers 12 --num-chunks 3
 - `create_chunked_coreml_state_specs()` - Creates CoreML state specs for a chunk
 
 **Verification:** The conversion script performs end-to-end verification comparing the original PyTorch model output against the chained CoreML chunks output.
+
+## Embeddings and LM Head Export
+
+For separate export of embeddings and language model head components, the library provides utilities to convert these independently:
+
+### Embeddings Export
+
+Embeddings are exported as `.npy` files in float16 format:
+
+```python
+from coremlmodels import export_embeddings
+
+# Export embeddings from a HuggingFace model
+export_embeddings(model, output_path="embeddings.npy", verbose=True)
+```
+
+**Output:**
+- `.npy` file containing embedding weights in float16 format
+- Shape: `(vocab_size, hidden_dim)`
+
+### LM Head Export with Chunking
+
+The Neural Engine has a weight dimension limit of ~16384. For language models with large vocabularies, the LM head weights `(vocab_size, hidden_dim)` may exceed this limit. The `convert_lm_head()` function addresses this by:
+
+1. **Chunking the vocabulary** into smaller pieces (default: 6144 tokens per chunk)
+2. **Computing log-sum-exp per chunk** with numerical stability for float16
+3. **Adding temperature scaling** as an input parameter
+
+```python
+from coremlmodels import convert_lm_head
+
+mlmodel = convert_lm_head(
+    lm_head=model.lm_head,
+    batch_size=1,
+    hidden_dim=2048,
+    seq_len=8,
+    output_path="lm_head.mlpackage",
+    chunk_size=6144,           # Vocabulary chunk size
+    compute_logsumexp=True,    # Compute log-sum-exp for each chunk
+    verbose=True,
+)
+```
+
+**Input Format:**
+- `hidden_states`: `(batch, hidden_dim, 1, seq_len)` - Hidden states from the model
+- `temperature`: `(1, 1, 1, 1)` - Temperature scaling factor for logits
+
+**Output Format (when `compute_logsumexp=True`):**
+
+The model returns 3 outputs that allow reconstructing the full log-sum-exp:
+
+1. `logits`: `(batch, vocab_size, 1, seq_len)` - Temperature-scaled logits for all vocabulary tokens
+2. `chunk_logsumexp_stable`: `(batch, num_chunks, 1, seq_len)` - Stable log-sum-exp component per chunk: `log(sum(exp(x/T - max(x/T))))`
+3. `chunk_max`: `(batch, num_chunks, 1, seq_len)` - Maximum value per chunk: `max(x/T)`
+
+**Reconstructing full log-sum-exp:**
+
+```python
+# For each chunk: chunk_lse = chunk_logsumexp_stable + chunk_max
+chunk_lse = chunk_logsumexp_stable + chunk_max  # (batch, num_chunks, 1, seq_len)
+
+# Apply logsumexp reduction over chunks to get final value
+import torch
+full_logsumexp = torch.logsumexp(torch.from_numpy(chunk_lse), dim=1, keepdim=True)
+```
+
+### Usage Examples
+
+
+```bash
+# Export embeddings and LM head along with full model conversion
+uv run python examples/lm_conversion_example.py --export-embeddings --export-lm-head
+
+# Export only components (skip main model conversion)
+uv run python examples/lm_conversion_example.py --export-embeddings --export-lm-head --components-only
+```
 
 ## Full Language Model Conversion Example
 

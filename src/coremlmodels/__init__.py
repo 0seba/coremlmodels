@@ -3,6 +3,8 @@
 __version__ = "0.1.0"
 
 from .analysis import analyze_compute_plan, inspect_mil_program
+from .chunked_lm_head import ChunkedLMHead
+from .export_utils import convert_lm_head, export_embeddings
 from .graph_passes import register_extended_passes
 from .lm_model_wrapper import (
     ChunkedLanguageModelWrapper,
@@ -43,6 +45,11 @@ __all__ = [
     "ChunkedLanguageModelWrapper",
     "create_coreml_state_specs",
     "create_chunked_coreml_state_specs",
+    # Chunked LM head
+    "ChunkedLMHead",
+    # Export utilities
+    "export_embeddings",
+    "convert_lm_head",
     # Architecture registry
     "ARCHITECTURE_REGISTRY",
     "ArchitectureConfig",
