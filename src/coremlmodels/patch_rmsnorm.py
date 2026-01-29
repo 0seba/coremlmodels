@@ -65,8 +65,14 @@ class RMSNormToLayerNormPatcher(nn.Module):
             original_weight = rmsnorm_layer.weight.detach()
             self.register_buffer("weight", original_weight)
             self.normalized_shape = original_weight.shape[0]
+
+            # Pre-compute weight_concat for the [x, -x] trick
+            # [weight, zeros] to only scale the x portion
+            weight_concat = torch.cat([original_weight, torch.zeros_like(original_weight)])
+            self.register_buffer("weight_concat", weight_concat)
         else:
             self.weight = None
+            self.weight_concat = None
             # Infer normalized_shape from layer if possible
             if hasattr(rmsnorm_layer, "normalized_shape"):
                 self.normalized_shape = rmsnorm_layer.normalized_shape
@@ -110,17 +116,12 @@ class RMSNormToLayerNormPatcher(nn.Module):
         # Create [x, -x] along last dimension for RMSNorm behavior
         x_concat = torch.cat([x, -x], dim=-1)
 
-        # Prepare weight: [weight, zeros] to only scale the x portion
-        if self.weight is not None:
-            weight_concat = torch.cat([self.weight, torch.zeros_like(self.weight)])
-        else:
-            weight_concat = None
-
         # Apply layer_norm on the concatenated last dimension
+        # Uses pre-computed weight_concat: [weight, zeros] to only scale the x portion
         out = F.layer_norm(
             x_concat.float(),
             [x_concat.size(-1)],
-            weight=weight_concat,
+            weight=self.weight_concat,
             bias=None,
             eps=self.eps,
         )
@@ -135,6 +136,7 @@ class RMSNormToLayerNormPatcher(nn.Module):
 
         This method handles normalization over any axis by concatenating
         [x, -x] along that axis and performing LayerNorm-equivalent operations.
+        The modified fuse_layernorm_or_instancenorm pass will fuse this pattern.
         """
         # Concatenate [x, -x] along the specified axis
         x_concat = torch.cat([x, -x], dim=axis)
@@ -145,7 +147,7 @@ class RMSNormToLayerNormPatcher(nn.Module):
         # Perform in float32 for numerical stability during tracing
         x_float = x_concat.float()
 
-        # LayerNorm-equivalent operations (CoreMLTools will fuse these)
+        # LayerNorm-equivalent operations (modified CoreMLTools pass will fuse these)
         # 1. Compute mean along the normalization axis
         channels_mean = x_float.mean(dim=axis, keepdim=True)
 
@@ -163,14 +165,11 @@ class RMSNormToLayerNormPatcher(nn.Module):
         out = zero_mean * denom
 
         # Apply weight if present - reshape based on axis
-        if self.weight is not None:
-            # Create [weight, zeros] for the concat trick
-            weight_concat = torch.cat([self.weight, torch.zeros_like(self.weight)])
-
+        if self.weight_concat is not None:
             # Reshape weight for broadcasting: [1, 1, ..., 2*normalized_shape, ..., 1]
             shape = [1] * x_concat.ndim
-            shape[axis] = weight_concat.shape[0]
-            weight_reshaped = weight_concat.view(*shape)
+            shape[axis] = self.weight_concat.shape[0]
+            weight_reshaped = self.weight_concat.view(*shape)
 
             out = out * weight_reshaped
 

@@ -3,6 +3,7 @@
 __version__ = "0.1.0"
 
 from .analysis import analyze_compute_plan, inspect_mil_program
+from .graph_passes import register_extended_passes
 from .lm_model_wrapper import LanguageModelWrapper, create_coreml_state_specs
 from .patch_attention import (
     AttentionPatcher,
@@ -44,4 +45,6 @@ __all__ = [
     # Analysis utilities
     "analyze_compute_plan",
     "inspect_mil_program",
+    # Graph passes
+    "register_extended_passes",
 ]

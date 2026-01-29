@@ -615,19 +615,68 @@ ios16.conv           | input_cast_fp16                | NeuralEngine    | 1.73e-
 | `patch_attention.py` | `AttentionPatcher`, `patch_model_attention` | Attention -> ANE-optimized channels-first with QK-norm |
 | `lm_model_wrapper.py` | `LanguageModelWrapper`, `create_coreml_state_specs` | LM wrapper with KV cache state |
 | `registry.py` | `ArchitectureConfig`, `get_architecture_config`, `find_target_classes` | Architecture auto-detection |
+| `graph_passes.py` | `fuse_layernorm_or_instancenorm`, `register_extended_passes` | Extended CoreMLTools graph passes |
 | `analysis.py` | `analyze_compute_plan`, `inspect_mil_program` | CoreML verification tools |
+
+## Extended Graph Passes
+
+### Why Custom Graph Passes?
+
+CoreMLTools applies graph optimization passes during `ct.convert()` that detect operation patterns and fuse them into optimized operations. However, the default `fuse_layernorm_or_instancenorm` pass only recognizes LayerNorm patterns when normalization happens over **axis=1**.
+
+This limitation causes problems for:
+- **QK-norm in attention**: Query states need normalization over axis=2 (head_dim in BCHW format)
+- **Gamma-only patterns**: RMSNorm has gamma but no beta, which the original pass didn't handle for single-axis cases
+
+Without fusion, the computation graph contains separate operations:
+```
+reduce_mean -> sub -> mul -> reduce_mean -> add -> rsqrt -> mul -> mul(gamma)
+```
+
+With our extended pass, these fuse into a single optimized operation:
+```
+layer_norm (with gamma included)
+```
+
+### Using Extended Passes
+
+The `graph_passes.py` module provides an extended version of CoreMLTools' fusion pass. **Import it before calling `ct.convert()`**:
+
+```python
+from coremlmodels import register_extended_passes
+
+# Register extended passes (overrides CoreMLTools defaults)
+register_extended_passes()
+
+# Now convert - LayerNorm fusion works for any single axis
+mlmodel = ct.convert(traced_model, ...)
+```
+
+See `src/coremlmodels/graph_passes.py` for implementation details and inline documentation of the modifications.
+
+### Design Guideline: Minimize Tensor Manipulations
+
+Because the extended pass supports normalization over **any single axis**, you should **avoid using transpose, permute, or reshape** operations just to move the target axis to position 1 before normalization.
+
+**Good** - Normalize directly over the target axis:
+```python
+# Query states: (batch, heads, head_dim, seq) - normalize over head_dim (axis=2)
+out = rmsnorm_patcher(query_states, axis=2)
+```
+
+**Bad** - Transpose to make target axis=1, normalize, transpose back:
+```python
+# Don't do this! Unnecessary transposes may cause graph cuts
+x = query_states.permute(0, 2, 1, 3)  # Move head_dim to axis=1
+out = rmsnorm_patcher(x, axis=1)
+out = out.permute(0, 2, 1, 3)  # Move back
+```
+
+This keeps the computation graph cleaner and avoids potential inefficiencies on the Neural Engine.
 
 ## Known Limitations
 
-### RMSNorm Weight Fusion
-
-The RMSNorm weight multiplication is **not fused** into the `layer_norm` MIL operation:
-
-```
-layer_norm -> mul (weight) -> split
-```
-
-The weight appears as a separate `mul` operation after `layer_norm`. Future work could write a CoreMLTools graph pass to fuse this pattern.
+(No current limitations - RMSNorm weight fusion now works with the extended graph pass)
 
 ## Full Language Model Conversion Example
 

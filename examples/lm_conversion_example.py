@@ -23,6 +23,9 @@ Usage:
     # Convert Qwen3 model
     uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-0.6B
 
+    # Quick debug with only 2 layers
+    uv run python examples/lm_conversion_example.py --num-layers 2
+
     # Custom cache length
     uv run python examples/lm_conversion_example.py --cache-length 4096
 """
@@ -46,6 +49,7 @@ from coremlmodels import (
     patch_model_attention,
     patch_model_linears,
     patch_model_rmsnorms,
+    register_extended_passes,
 )
 
 
@@ -54,6 +58,7 @@ def convert_language_model(
     seq_len: int = 8,
     cache_length: int = 2048,
     batch_size: int = 1,
+    num_layers: int | None = None,
     output_path: str | None = None,
     verbose: bool = True,
 ):
@@ -64,6 +69,8 @@ def convert_language_model(
         seq_len: Sequence length for tracing.
         cache_length: Maximum KV cache length.
         batch_size: Batch size for the model.
+        num_layers: Number of transformer layers to keep. If None, use all layers.
+                    Useful for faster debugging and testing.
         output_path: Path to save the converted model. If None, auto-generated.
         verbose: Print detailed information during conversion.
 
@@ -96,6 +103,12 @@ def convert_language_model(
         device_map="cpu",
     )
     model.eval()
+
+    # Optionally truncate to fewer layers for faster debugging
+    if num_layers is not None and num_layers < config.num_hidden_layers:
+        print(f"    Truncating model from {config.num_hidden_layers} to {num_layers} layers...")
+        model.layers = model.layers[:num_layers]
+        config.num_hidden_layers = num_layers
 
     # Keep a copy of the original model for comparison
     original_model = copy.deepcopy(model)
@@ -168,6 +181,11 @@ def convert_language_model(
 
     # 10. Convert to CoreML
     print("\n[10] Converting to CoreML...")
+
+    # Register extended graph passes to support LayerNorm fusion on any axis
+    # (required for QK-norm patterns which use axis=2)
+    register_extended_passes()
+
     mlmodel = ct.convert(
         traced_model,
         inputs=[
@@ -305,6 +323,9 @@ Examples:
     # Convert Qwen3 model
     python examples/lm_conversion_example.py --model Qwen/Qwen3-0.6B
 
+    # Quick debug with only 2 layers
+    python examples/lm_conversion_example.py --num-layers 2
+
     # Custom settings
     python examples/lm_conversion_example.py --model Qwen/Qwen2-0.5B --seq-len 16 --cache-length 4096
         """,
@@ -328,6 +349,12 @@ Examples:
         help="Maximum KV cache length (default: 2048)",
     )
     parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=None,
+        help="Number of transformer layers to keep (default: all). Useful for faster debugging.",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default=None,
@@ -345,6 +372,7 @@ Examples:
         model_name=args.model,
         seq_len=args.seq_len,
         cache_length=args.cache_length,
+        num_layers=args.num_layers,
         output_path=args.output,
         verbose=not args.quiet,
     )
