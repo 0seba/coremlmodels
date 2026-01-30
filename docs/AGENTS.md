@@ -42,6 +42,10 @@ uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chun
 uv run python examples/export_embeddings_lmhead.py                 # Export both
 uv run python examples/lm_conversion_example.py --export-embeddings --export-lm-head --components-only
 
+# Run inference with converted model
+uv run python examples/inference.py --model-dir ./qwen2_0.5b_seqlen_8.mlpackage --model-name Qwen/Qwen2-0.5B
+uv run python examples/inference.py --model-dir ./qwen3_4b_chunked_4 --model-name Qwen/Qwen3-4B --chunked --num-chunks 4
+
 # Lint code
 uv run ruff check .
 ```
@@ -824,6 +828,55 @@ This example demonstrates:
 5. Converting with `ct.StateType` for stateful inference
 6. Comparing PyTorch vs CoreML outputs
 7. Analyzing compute plan and MIL program
+
+## CoreML Model Inference
+
+After converting your model with [lm_conversion_example.py](lm_conversion_example.py), use the inference script to run the model:
+
+```bash
+# Single model inference with chat interface
+uv run python examples/inference.py \
+    --model-dir ./qwen2_0.5b_seqlen_8.mlpackage \
+    --model-name Qwen/Qwen2-0.5B
+
+# Chunked model inference
+uv run python examples/inference.py \
+    --model-dir ./qwen3_4b_chunked_4 \
+    --model-name Qwen/Qwen3-4B \
+    --chunked \
+    --num-chunks 4
+
+# Single prompt (non-interactive)
+uv run python examples/inference.py \
+    --model-dir ./qwen2_0.5b_seqlen_8.mlpackage \
+    --model-name Qwen/Qwen2-0.5B \
+    --prompt "What is machine learning?"
+
+# Custom sampling parameters
+uv run python examples/inference.py \
+    --model-dir ./model \
+    --model-name Qwen/Qwen2-0.5B \
+    --temperature 0.7 \
+    --top-p 0.9 \
+    --top-k 40 \
+    --max-new-tokens 200
+```
+
+**Key features of the inference script:**
+- **Embedding management:** Loads embeddings from `.npy` files and performs numpy-based token lookup
+- **Prompt chunking:** Automatically splits long prompts into chunks that fit the model's sequence length
+- **Token generation:** Generates tokens one at a time using the stateful KV cache
+- **Top-k and top-p sampling:** Implements nucleus sampling for controlled text generation
+- **Chat interface:** Interactive chat loop with conversation history management
+- **Chunked model support:** Chains multiple CoreML chunks for large models
+
+**Dependencies:** numpy, coremltools, transformers (tokenization only)
+
+**Important notes:**
+- The script requires embeddings (`embeddings.npy`) and LM head (`lm_head.mlpackage`) to be present in the model directory
+- Export these components using the conversion script with `--export-embeddings --export-lm-head`
+- Temperature is applied in the LM head model, but can be adjusted during sampling
+- The KV cache is stateful - reset it with `/reset` command in chat mode
 
 ## Development Workflow
 
