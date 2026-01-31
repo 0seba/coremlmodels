@@ -33,18 +33,11 @@ uv run pytest tests/test_patch_rmsnorms.py -v
 # Run simple conversion example
 uv run python examples/rmsnorm_conversion_example.py
 
-# Run full LLM conversion example (architecture-agnostic)
-uv run python examples/lm_conversion_example.py                    # Qwen2 (default)
-uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-0.6B  # Qwen3 with QK-norm
-uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4  # Large model chunked
+# Run full LLM conversion (see CONVERSION_GUIDE.md for details)
+uv run python examples/lm_conversion_example.py --model Qwen/Qwen2-0.5B
 
-# Export embeddings and LM head separately
-uv run python examples/export_embeddings_lmhead.py                 # Export both
-uv run python examples/lm_conversion_example.py --export-embeddings --export-lm-head --components-only
-
-# Run inference with converted model
-uv run python examples/inference.py --model-dir ./qwen2_0.5b_seqlen_8.mlpackage --model-name Qwen/Qwen2-0.5B
-uv run python examples/inference.py --model-dir ./qwen3_4b_chunked_4 --model-name Qwen/Qwen3-4B --chunked --num-chunks 4
+# Run inference (see INFERENCE_GUIDE.md for details)
+uv run python examples/inference.py --model-dir ./model --model-name Qwen/Qwen2-0.5B
 
 # Lint code
 uv run ruff check .
@@ -520,63 +513,30 @@ inspect_mil_program(mlmodel)
 ```
 
 **Example output:**
-
 ```
-=== MIL Program Structure ===
-opset version: 2024.1
+=== MIL Program Inspection ===
+Looking for: conv, layer_norm
 
-Operation: mul
-  Output: var_10_cast_fp16 [1, 512, 1, 512] (fp16)
-  Inputs:
-    - x: input [1, 512, 1, 512] (fp16)
-    - y: -0x1p+0 [] (fp16)
-----------------------------------------
-Operation: concat
-  Output: x_concat_1_cast_fp16 [1, 1024, 1, 512] (fp16)
-  Inputs:
-    - axis: 1 [] (int32)
-    - interleave: false [] (bool)
-    - values:
-      - input [1, 512, 1, 512] (fp16)
-      - var_10_cast_fp16 [1, 512, 1, 512] (fp16)
-----------------------------------------
-Operation: layer_norm
-  Output: out_1_cast_fp16 [1, 1024, 1, 512] (fp16)
-  Inputs:
-    - axes: [1] [1] (int32)
-    - epsilon: 0x1.5p-17 [] (fp16)
-    - x: x_concat_1_cast_fp16 [1, 1024, 1, 512] (fp16)
-----------------------------------------
-Operation: mul
-  Output: out_3_cast_fp16 [1, 1024, 1, 512] (fp16)
-  Inputs:
-    - x: out_1_cast_fp16 [1, 1024, 1, 512] (fp16)
-    - y: Weights [1, 1024, 1, 1] (fp16)
-----------------------------------------
-Operation: split
-  Output: var_25_cast_fp16_0, [1, 512, 1, 512] (fp16)
-  Inputs:
-    - axis: 1 [] (int32)
-    - split_sizes: [512, 512] [2] (int32)
-    - x: out_3_cast_fp16 [1, 1024, 1, 512] (fp16)
-----------------------------------------
-Operation: conv
-  Output: input_cast_fp16 [1, 2048, 1, 512] (fp16)
-  Inputs:
-    - bias: Weights [2048] (fp16)
-    - dilations: [1, 1] [2] (int32)
-    - groups: 1 [] (int32)
-    - pad: [0, 0, 0, 0] [4] (int32)
-    - pad_type: "valid" [] (string)
-    - strides: [1, 1] [2] (int32)
-    - weight: Weights [2048, 512, 1, 1] (fp16)
-    - x: var_25_cast_fp16_0
-----------------------------------------
-Operation: gelu
-  Output: x_5_cast_fp16 [1, 2048, 1, 512] (fp16)
-  Inputs:
-    - mode: "EXACT" [] (string)
-    - x: input_cast_fp16 [1, 2048, 1, 512] (fp16)
+[conv] conv_0
+  Input 0: x (Tensor<fp16, [1, 1024, 1, 512]>)
+  Input 1: linear1_weight_to_fp16 (Tensor<fp16, [4096, 1024, 1, 1]>)
+  Input 2: linear1_bias_to_fp16 (Tensor<fp16, [4096]>)
+  Output: conv_0 (Tensor<fp16, [1, 4096, 1, 512]>)
+
+[layer_norm] layer_norm_0
+  Input 0: concat_0 (Tensor<fp16, [1, 8192, 1, 512]>)
+  Input 1: None
+  Input 2: None
+  Attributes: axes=[-3], epsilon=9.999999747378752e-06
+  Output: layer_norm_0 (Tensor<fp16, [1, 8192, 1, 512]>)
+
+[conv] conv_1
+  Input 0: slice_by_index_0 (Tensor<fp16, [1, 4096, 1, 512]>)
+  Input 1: linear2_weight_to_fp16 (Tensor<fp16, [1024, 4096, 1, 1]>)
+  Input 2: linear2_bias_to_fp16 (Tensor<fp16, [1024]>)
+  Output: conv_1 (Tensor<fp16, [1, 1024, 1, 512]>)
+
+Total operations found: 3
 ```
 
 **What to look for:**
@@ -594,20 +554,33 @@ analyze_compute_plan(mlmodel)
 ```
 
 **Example output:**
-
 ```
 === Compute Plan Analysis ===
-Model: simple_model.mlmodel
 
-Operation            | Identifier                     | Selected Device | Cost       | Supported Devices
-------------------------------------------------------------------------------------------------------------------------
-ios16.mul            | var_10_cast_fp16               | NeuralEngine    | 3.17e-02   | CPU,GPU,NE
-concat               | x_concat_1_cast_fp16           | NeuralEngine    | 2.72e-02   | CPU,GPU,NE
-ios16.layer_norm     | out_1_cast_fp16                | NeuralEngine    | 7.46e-02   | CPU,GPU,NE
-ios16.mul            | out_3_cast_fp16                | NeuralEngine    | 6.34e-02   | CPU,GPU,NE
-split                | var_25_cast_fp16_0             | NeuralEngine    | 5.59e-02   | CPU,GPU,NE
-ios16.conv           | input_cast_fp16                | NeuralEngine    | 1.73e-01   | CPU,GPU,NE
-...
+Operation                          | Selected Device | Compute   | Memory
+-----------------------------------|-----------------|-----------|----------
+const                              | CPU             | 0         | 8
+const                              | CPU             | 0         | 16777220
+const                              | CPU             | 0         | 16384
+cast                               | NeuralEngine    | 1024      | 0
+conv                               | NeuralEngine    | 4294967296| 0
+const                              | CPU             | 0         | 33554436
+const                              | CPU             | 0         | 32768
+concat                             | NeuralEngine    | 0         | 0
+layer_norm                         | NeuralEngine    | 100663296 | 0
+split                              | NeuralEngine    | 0         | 0
+squeeze                            | NeuralEngine    | 0         | 0
+mul                                | NeuralEngine    | 2097152   | 0
+expand_dims                        | NeuralEngine    | 0         | 0
+conv                               | NeuralEngine    | 4294967296| 0
+cast                               | CPU             | 0         | 0
+-----------------------------------|-----------------|-----------|----------
+
+Summary:
+  Total operations: 15
+  Neural Engine ops: 9
+  CPU ops: 6
+  GPU ops: 0
 ```
 
 **What to look for:**
@@ -695,188 +668,24 @@ This keeps the computation graph cleaner and avoids potential inefficiencies on 
 
 **Neural Engine Model Size Limit (~2GB):** Apple's Neural Engine can only load models up to approximately 2GB. For larger models (e.g., Qwen3-4B with 4 billion parameters), you must split the model into multiple chunks.
 
-## Chunked Model Conversion for Large Models
+## Language Model Conversion and Inference
 
-For models exceeding the ~2GB Neural Engine limit, use the `--num-chunks` argument to split the model into multiple CoreML packages:
+For full language model workflows:
 
+- **[CONVERSION_GUIDE.md](CONVERSION_GUIDE.md)** - Detailed guide for converting HuggingFace models to CoreML with memory optimization options
+- **[INFERENCE_GUIDE.md](INFERENCE_GUIDE.md)** - Guide for running inference with converted models
+
+Quick reference:
 ```bash
-# Convert Qwen3-4B in 4 chunks
-uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4
+# Convert a model (single)
+uv run python examples/lm_conversion_example.py --model Qwen/Qwen2-0.5B --export-embeddings --export-lm-head
 
-# Test chunking with fewer layers (faster debugging)
-uv run python examples/lm_conversion_example.py --num-layers 12 --num-chunks 3
+# Convert large model (chunked, memory-efficient)
+uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4 --chunk-index 0 --skip-model-load
+
+# Run inference
+uv run python examples/inference.py --model-dir ./model --model-name Qwen/Qwen2-0.5B
 ```
-
-**How chunking works:**
-- The model's transformer layers are partitioned into N chunks
-- Each chunk has its own independent KV cache (sized for its layer count)
-- Chunks are converted to separate `.mlpackage` files in an output directory
-- At inference time, chain the chunks sequentially: output of chunk N feeds into chunk N+1
-- The final chunk applies the model's output layer norm
-
-**Key classes:**
-- `ChunkedLanguageModelWrapper` - Wraps a subset of layers with its own KV cache
-- `create_chunked_coreml_state_specs()` - Creates CoreML state specs for a chunk
-
-**Verification:** The conversion script performs end-to-end verification comparing the original PyTorch model output against the chained CoreML chunks output.
-
-## Embeddings and LM Head Export
-
-For separate export of embeddings and language model head components, the library provides utilities to convert these independently:
-
-### Embeddings Export
-
-Embeddings are exported as `.npy` files in float16 format:
-
-```python
-from coremlmodels import export_embeddings
-
-# Export embeddings from a HuggingFace model
-export_embeddings(model, output_path="embeddings.npy", verbose=True)
-```
-
-**Output:**
-- `.npy` file containing embedding weights in float16 format
-- Shape: `(vocab_size, hidden_dim)`
-
-### LM Head Export with Chunking
-
-The Neural Engine has a weight dimension limit of ~16384. For language models with large vocabularies, the LM head weights `(vocab_size, hidden_dim)` may exceed this limit. The `convert_lm_head()` function addresses this by:
-
-1. **Chunking the vocabulary** into smaller pieces (default: 6144 tokens per chunk)
-2. **Computing log-sum-exp per chunk** with numerical stability for float16
-3. **Adding temperature scaling** as an input parameter
-
-```python
-from coremlmodels import convert_lm_head
-
-mlmodel = convert_lm_head(
-    lm_head=model.lm_head,
-    batch_size=1,
-    hidden_dim=2048,
-    seq_len=8,
-    output_path="lm_head.mlpackage",
-    chunk_size=6144,           # Vocabulary chunk size
-    compute_logsumexp=True,    # Compute log-sum-exp for each chunk
-    verbose=True,
-)
-```
-
-**Input Format:**
-- `hidden_states`: `(batch, hidden_dim, 1, seq_len)` - Hidden states from the model
-- `temperature`: `(1, 1, 1, 1)` - Temperature scaling factor for logits
-
-**Output Format (when `compute_logsumexp=True`):**
-
-The model returns 3 outputs that allow reconstructing the full log-sum-exp:
-
-1. `logits`: `(batch, vocab_size, 1, seq_len)` - Temperature-scaled logits for all vocabulary tokens
-2. `chunk_logsumexp_stable`: `(batch, num_chunks, 1, seq_len)` - Stable log-sum-exp component per chunk: `log(sum(exp(x/T - max(x/T))))`
-3. `chunk_max`: `(batch, num_chunks, 1, seq_len)` - Maximum value per chunk: `max(x/T)`
-
-**Reconstructing full log-sum-exp:**
-
-```python
-# For each chunk: chunk_lse = chunk_logsumexp_stable + chunk_max
-chunk_lse = chunk_logsumexp_stable + chunk_max  # (batch, num_chunks, 1, seq_len)
-
-# Apply logsumexp reduction over chunks to get final value
-import torch
-full_logsumexp = torch.logsumexp(torch.from_numpy(chunk_lse), dim=1, keepdim=True)
-```
-
-### Usage Examples
-
-
-```bash
-# Export embeddings and LM head along with full model conversion
-uv run python examples/lm_conversion_example.py --export-embeddings --export-lm-head
-
-# Export only components (skip main model conversion)
-uv run python examples/lm_conversion_example.py --export-embeddings --export-lm-head --components-only
-```
-
-## Full Language Model Conversion Example
-
-For converting complete HuggingFace language models with KV cache, see:
-
-```bash
-# Convert Qwen2 (default)
-uv run python examples/lm_conversion_example.py
-
-# Convert Qwen3 (with QK-norm)
-uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-0.6B
-
-# Custom parameters
-uv run python examples/lm_conversion_example.py \
-    --model Qwen/Qwen2-0.5B \
-    --seq-len 16 \
-    --cache-length 512 \
-    --output my_model.mlpackage
-
-# Quiet mode (less verbose output)
-uv run python examples/lm_conversion_example.py --quiet
-```
-
-**Supported architectures:** Qwen2, Qwen3 (see `get_supported_architectures()`)
-
-This example demonstrates:
-1. **Auto-detecting architecture** from model config using the registry
-2. **Finding target classes** dynamically (attention, RMSNorm)
-3. Patching Linear, RMSNorm, and Attention layers (with QK-norm if applicable)
-4. Wrapping with `LanguageModelWrapper` for KV cache as CoreML state
-5. Converting with `ct.StateType` for stateful inference
-6. Comparing PyTorch vs CoreML outputs
-7. Analyzing compute plan and MIL program
-
-## CoreML Model Inference
-
-After converting your model with [lm_conversion_example.py](lm_conversion_example.py), use the inference script to run the model:
-
-```bash
-# Single model inference with chat interface
-uv run python examples/inference.py \
-    --model-dir ./qwen2_0.5b_seqlen_8.mlpackage \
-    --model-name Qwen/Qwen2-0.5B
-
-# Chunked model inference
-uv run python examples/inference.py \
-    --model-dir ./qwen3_4b_chunked_4 \
-    --model-name Qwen/Qwen3-4B \
-    --chunked \
-    --num-chunks 4
-
-# Single prompt (non-interactive)
-uv run python examples/inference.py \
-    --model-dir ./qwen2_0.5b_seqlen_8.mlpackage \
-    --model-name Qwen/Qwen2-0.5B \
-    --prompt "What is machine learning?"
-
-# Custom sampling parameters
-uv run python examples/inference.py \
-    --model-dir ./model \
-    --model-name Qwen/Qwen2-0.5B \
-    --temperature 0.7 \
-    --top-p 0.9 \
-    --top-k 40 \
-    --max-new-tokens 200
-```
-
-**Key features of the inference script:**
-- **Embedding management:** Loads embeddings from `.npy` files and performs numpy-based token lookup
-- **Prompt chunking:** Automatically splits long prompts into chunks that fit the model's sequence length
-- **Token generation:** Generates tokens one at a time using the stateful KV cache
-- **Top-k and top-p sampling:** Implements nucleus sampling for controlled text generation
-- **Chat interface:** Interactive chat loop with conversation history management
-- **Chunked model support:** Chains multiple CoreML chunks for large models
-
-**Dependencies:** numpy, coremltools, transformers (tokenization only)
-
-**Important notes:**
-- The script requires embeddings (`embeddings.npy`) and LM head (`lm_head.mlpackage`) to be present in the model directory
-- Export these components using the conversion script with `--export-embeddings --export-lm-head`
-- Temperature is applied in the LM head model, but can be adjusted during sampling
-- The KV cache is stateful - reset it with `/reset` command in chat mode
 
 ## Development Workflow
 
@@ -892,3 +701,5 @@ uv run python examples/inference.py \
 2. **[CODEBASE_STRUCTURE.md](CODEBASE_STRUCTURE.md)** - Directory layout
 3. **[CODING_STANDARDS.md](CODING_STANDARDS.md)** - Code style and patterns
 4. **[RMSNORM_PATCHING.md](RMSNORM_PATCHING.md)** - Mathematical background
+5. **[CONVERSION_GUIDE.md](CONVERSION_GUIDE.md)** - Model conversion details
+6. **[INFERENCE_GUIDE.md](INFERENCE_GUIDE.md)** - Running inference

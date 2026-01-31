@@ -27,6 +27,16 @@ Usage:
     # Convert large model in 4 chunks (for models > 2GB)
     uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4
 
+    # Convert only specific chunks (reduces memory usage)
+    uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4 --chunk-index 0
+    uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4 --chunk-index 1,2
+
+    # Skip verification to reduce memory (useful for large models)
+    uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4 --skip-verification
+
+    # Minimum memory mode: convert one chunk at a time, skip model load
+    uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4 --chunk-index 0 --skip-model-load
+
     # Export embeddings and LM head (with model conversion)
     uv run python examples/lm_conversion_example.py --export-embeddings --export-lm-head
 
@@ -45,6 +55,7 @@ Usage:
 
 import argparse
 import copy
+import gc
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,13 +97,15 @@ class ModelContext:
     """Holds loaded model, config, and architecture information."""
 
     model: nn.Module
-    original_model: nn.Module
     config: object
     arch_config: object
     attention_classes: tuple
     rmsnorm_classes: tuple
     hidden_dim: int
     model_type: str
+    # Pre-computed reference output for verification (much smaller than full model copy)
+    reference_output: np.ndarray | None = None
+    reference_input_cf: np.ndarray | None = None
 
 
 @dataclass
@@ -116,6 +129,9 @@ def load_model_and_config(
     model_name: str,
     num_layers: int | None = None,
     verbose: bool = True,
+    compute_reference: bool = True,
+    batch_size: int = 1,
+    seq_len: int = 8,
 ) -> ModelContext:
     """Load model from HuggingFace and detect architecture.
 
@@ -123,6 +139,10 @@ def load_model_and_config(
         model_name: HuggingFace model name.
         num_layers: Optional layer limit for debugging.
         verbose: Print detailed information.
+        compute_reference: Compute reference output before patching for verification.
+            Set to False to skip (reduces memory slightly, skips verification).
+        batch_size: Batch size for reference output computation.
+        seq_len: Sequence length for reference output computation.
 
     Returns:
         ModelContext with loaded model and configuration.
@@ -161,11 +181,18 @@ def load_model_and_config(
         model.layers = model.layers[:num_layers]
         config.num_hidden_layers = num_layers
 
-    # Keep original for comparison
-    original_model = copy.deepcopy(model)
-    original_model.eval()
-
     hidden_dim = config.hidden_size
+
+    # Compute reference output before patching (much smaller than keeping full model copy)
+    reference_output = None
+    reference_input_cf = None
+    if compute_reference:
+        if verbose:
+            print("    Computing reference output before patching...")
+        reference_input_cf, _, reference_input_sf = create_test_inputs(batch_size, hidden_dim, seq_len)
+        reference_output = run_original_model(model, reference_input_sf, seq_len)
+        if verbose:
+            print(f"    Reference output shape: {reference_output.shape}")
     if verbose:
         print(f"    Hidden dim: {hidden_dim}")
         print(f"    Num layers: {config.num_hidden_layers}")
@@ -183,13 +210,14 @@ def load_model_and_config(
 
     return ModelContext(
         model=model,
-        original_model=original_model,
         config=config,
         arch_config=arch_config,
         attention_classes=attention_classes,
         rmsnorm_classes=rmsnorm_classes,
         hidden_dim=hidden_dim,
         model_type=model_type,
+        reference_output=reference_output,
+        reference_input_cf=reference_input_cf,
     )
 
 
@@ -354,6 +382,8 @@ def convert_to_coreml(
     seq_len: int,
     state_specs: list,
     input_name: str = "inputs_embeds",
+    package_dir: str | None = None,
+    skip_model_load: bool = False,
 ):
     """Convert traced model to CoreML.
 
@@ -364,6 +394,10 @@ def convert_to_coreml(
         seq_len: Sequence length.
         state_specs: CoreML state specifications.
         input_name: Name for the input tensor.
+        package_dir: If provided, save model directly to this path during conversion.
+            Must end with .mlpackage. Avoids creating a temporary directory.
+        skip_model_load: If True, skip loading the model after conversion.
+            Useful for reducing memory or converting on older macOS versions.
 
     Returns:
         Converted CoreML model.
@@ -388,6 +422,8 @@ def convert_to_coreml(
         compute_precision=ct.precision.FLOAT16,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
         minimum_deployment_target=ct.target.iOS18,
+        package_dir=package_dir,
+        skip_model_load=skip_model_load,
     )
 
 
@@ -423,6 +459,7 @@ def convert_language_model(
     verbose: bool = True,
     analyze_compute: bool = False,
     analyze_mil: bool = False,
+    skip_model_load: bool = False,
 ):
     """Convert a HuggingFace language model to CoreML.
 
@@ -436,16 +473,26 @@ def convert_language_model(
         verbose: Print detailed information.
         analyze_compute: Run compute plan analysis.
         analyze_mil: Run MIL program inspection.
+        skip_model_load: Skip loading model after conversion to reduce memory.
 
     Returns:
-        Converted CoreML model.
+        Converted CoreML model (None if skip_model_load is True).
     """
     print("CoreML Language Model Conversion")
     print("=" * 60)
+    if skip_model_load:
+        print("Model loading after conversion will be skipped (memory optimization)")
 
     # Load model
     print("\n[1] Loading model and config...")
-    ctx = load_model_and_config(model_name, num_layers, verbose)
+    ctx = load_model_and_config(
+        model_name,
+        num_layers,
+        verbose,
+        compute_reference=not skip_model_load,
+        batch_size=batch_size,
+        seq_len=seq_len,
+    )
 
     # Patch layers
     print("\n[2] Patching model layers...")
@@ -479,7 +526,12 @@ def convert_language_model(
         traced_model = torch.jit.trace(wrapped_model, example_inputs)
     print("    Tracing complete!")
 
-    # Convert to CoreML
+    # Determine output path
+    if output_path is None:
+        model_short_name = model_name.split("/")[-1].lower().replace("-", "_")
+        output_path = f"{model_short_name}_seqlen_{seq_len}.mlpackage"
+
+    # Convert to CoreML (saves directly to package_dir)
     print("\n[5] Converting to CoreML...")
     register_extended_passes()
 
@@ -490,38 +542,40 @@ def convert_language_model(
         seq_len,
         create_coreml_state_specs(wrapped_model),
         input_name="inputs_embeds",
+        package_dir=output_path,
+        skip_model_load=skip_model_load,
     )
-
-    # Save model
-    if output_path is None:
-        model_short_name = model_name.split("/")[-1].lower().replace("-", "_")
-        output_path = f"{model_short_name}_seqlen_{seq_len}.mlpackage"
-
-    mlmodel.save(output_path)
     print(f"    Saved to: {output_path}")
 
     # Verification
     print("\n[6] Verifying outputs...")
-    test_input_cf, _, test_input_sf = create_test_inputs(batch_size, ctx.hidden_dim, seq_len)
+    if skip_model_load:
+        print("    Skipped (--skip-model-load flag set, model not loaded)")
+    elif ctx.reference_output is None:
+        print("    Skipped (reference output not available)")
+    else:
+        # Use pre-computed reference output from before patching
+        pytorch_output = ctx.reference_output
+        test_input_cf = ctx.reference_input_cf
 
-    pytorch_output = run_original_model(ctx.original_model, test_input_sf, seq_len)
-    state = mlmodel.make_state()
-    coreml_output = run_coreml_model(mlmodel, test_input_cf, 0, state)
+        state = mlmodel.make_state()
+        coreml_output = run_coreml_model(mlmodel, test_input_cf, 0, state)
 
-    print(f"    PyTorch output shape: {pytorch_output.shape}")
-    print(f"    CoreML output shape: {coreml_output.shape}")
+        print(f"    PyTorch output shape: {pytorch_output.shape}")
+        print(f"    CoreML output shape: {coreml_output.shape}")
 
-    result = compute_output_differences(pytorch_output, coreml_output)
-    print_verification_result(result, pytorch_output, coreml_output, indent="    ")
+        result = compute_output_differences(pytorch_output, coreml_output)
+        print_verification_result(result, pytorch_output, coreml_output, indent="    ")
 
-    # Test stateful inference
-    print("\n[7] Testing stateful inference (second forward pass)...")
-    output2 = run_coreml_model(mlmodel, test_input_cf, seq_len, state)
-    print(f"    Second output shape: {output2.shape}")
-    print(f"    Second output sample: {output2.flatten()[:5]}")
+        # Test stateful inference
+        print("\n[7] Testing stateful inference (second forward pass)...")
+        output2 = run_coreml_model(mlmodel, test_input_cf, seq_len, state)
+        print(f"    Second output shape: {output2.shape}")
+        print(f"    Second output sample: {output2.flatten()[:5]}")
 
-    # Optional analysis
-    run_model_analysis(mlmodel, analyze_compute, analyze_mil)
+    # Optional analysis (only if model is loaded)
+    if not skip_model_load:
+        run_model_analysis(mlmodel, analyze_compute, analyze_mil)
 
     # Summary
     print("\n" + "=" * 60)
@@ -570,11 +624,15 @@ def convert_single_chunk(
     seq_len: int,
     is_last_chunk: bool,
     output_path: Path,
+    skip_model_load: bool = False,
 ):
     """Convert a single chunk to CoreML.
 
+    Args:
+        skip_model_load: Skip loading model after conversion to reduce memory.
+
     Returns:
-        Tuple of (chunk_mlmodel, chunk_wrapper).
+        Tuple of (chunk_mlmodel, chunk_wrapper). chunk_mlmodel is None if skip_model_load is True.
     """
     print(f"\n    --- Chunk {chunk_idx} (layers {start_layer}-{end_layer-1}) ---")
 
@@ -631,7 +689,8 @@ def convert_single_chunk(
     with torch.inference_mode():
         traced_chunk = torch.jit.trace(chunk_wrapper, example_inputs)
 
-    # Convert
+    # Convert and save directly using package_dir
+    chunk_path = output_path / f"chunk_{chunk_idx}.mlpackage"
     print("    Converting to CoreML...")
     chunk_mlmodel = convert_to_coreml(
         traced_chunk,
@@ -640,11 +699,9 @@ def convert_single_chunk(
         seq_len,
         create_chunked_coreml_state_specs(chunk_wrapper),
         input_name="hidden_states",
+        package_dir=str(chunk_path),
+        skip_model_load=skip_model_load,
     )
-
-    # Save
-    chunk_path = output_path / f"chunk_{chunk_idx}.mlpackage"
-    chunk_mlmodel.save(str(chunk_path))
     print(f"    Saved to: {chunk_path}")
 
     return chunk_mlmodel, chunk_wrapper
@@ -652,38 +709,30 @@ def convert_single_chunk(
 
 def verify_chunked_model(
     chunk_models: list,
-    chunk_ranges: list,
-    original_model: nn.Module,
-    batch_size: int,
-    hidden_dim: int,
+    reference_output: np.ndarray,
+    reference_input_cf: np.ndarray,
     seq_len: int,
 ) -> VerificationResult:
-    """Verify chunked model outputs against original.
+    """Verify chunked model outputs against pre-computed reference.
 
     This performs end-to-end verification by:
-    1. Running the original unpatched PyTorch model with sequence-first input
+    1. Using the pre-computed reference output from the original model
     2. Chaining all CoreML chunks together with channels-first input
-    3. Comparing the final outputs (both converted to channels-first format)
-
-    Both paths start from the same random test data, ensuring a fair comparison.
+    3. Comparing the final outputs
 
     Returns:
         VerificationResult with comparison statistics.
     """
-    test_input_cf, _, test_input_sf = create_test_inputs(batch_size, hidden_dim, seq_len)
-
     # End-to-end verification: compare full original model vs chained CoreML chunks
     print("\n    End-to-end verification (Original PyTorch vs Chained CoreML Chunks)...")
 
-    # Path 1: Run original unpatched PyTorch model
-    # Input: sequence-first (batch, seq_len, hidden_dim)
-    # Output: converted to channels-first (batch, hidden_dim, 1, seq_len)
-    pytorch_output = run_original_model(original_model, test_input_sf, seq_len)
+    # Path 1: Use pre-computed reference output from original model
+    pytorch_output = reference_output
 
     # Path 2: Chain all CoreML chunks together
     # Input/Output: channels-first (batch, hidden_dim, 1, seq_len)
     chunk_states = [model.make_state() for model in chunk_models]
-    current_hidden = test_input_cf
+    current_hidden = reference_input_cf
 
     for chunk_idx, (chunk_model, chunk_state) in enumerate(zip(chunk_models, chunk_states)):
         result = chunk_model.predict(
@@ -702,7 +751,7 @@ def verify_chunked_model(
 
     # Test stateful inference (second forward pass to verify KV cache works)
     print("\n    Testing stateful inference (second forward pass across all chunks)...")
-    current_hidden = test_input_cf
+    current_hidden = reference_input_cf
     for chunk_model, chunk_state in zip(chunk_models, chunk_states):
         result = chunk_model.predict(
             {"hidden_states": current_hidden, "position_id": np.array([seq_len], dtype=np.int32)},
@@ -727,6 +776,9 @@ def convert_chunked_language_model(
     verbose: bool = True,
     analyze_compute: bool = False,
     analyze_mil: bool = False,
+    chunk_indices: list[int] | None = None,
+    skip_verification: bool = False,
+    skip_model_load: bool = False,
 ):
     """Convert a HuggingFace language model to multiple CoreML chunks.
 
@@ -741,17 +793,38 @@ def convert_chunked_language_model(
         verbose: Print detailed information.
         analyze_compute: Run compute plan analysis on each chunk.
         analyze_mil: Run MIL program inspection on each chunk.
+        chunk_indices: List of specific chunk indices to convert. If None, converts all.
+        skip_verification: Skip output verification to reduce memory usage.
+        skip_model_load: Skip loading model after conversion to reduce memory.
 
     Returns:
-        List of converted CoreML models.
+        List of converted CoreML models (empty if skip_model_load is True).
     """
     print("CoreML Chunked Language Model Conversion")
     print("=" * 60)
     print(f"Splitting model into {num_chunks} chunks")
+    if chunk_indices:
+        print(f"Converting only chunk(s): {chunk_indices}")
+    if skip_verification:
+        print("Verification will be skipped (memory optimization)")
+    if skip_model_load:
+        print("Model loading after conversion will be skipped (memory optimization)")
+
+    # Determine if we should compute reference output
+    # Skip if: explicit skip_verification, or converting partial chunks, or skip_model_load
+    converting_all_chunks = chunk_indices is None or len(chunk_indices) == num_chunks
+    should_compute_reference = not skip_verification and converting_all_chunks and not skip_model_load
 
     # Load model
     print("\n[1] Loading model and config...")
-    ctx = load_model_and_config(model_name, num_layers, verbose)
+    ctx = load_model_and_config(
+        model_name,
+        num_layers,
+        verbose,
+        compute_reference=should_compute_reference,
+        batch_size=batch_size,
+        seq_len=seq_len,
+    )
 
     total_layers = ctx.config.num_hidden_layers
 
@@ -786,11 +859,19 @@ def convert_chunked_language_model(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # Determine which chunks to convert
+    indices_to_convert = chunk_indices if chunk_indices else list(range(num_chunks))
+    # Validate indices
+    for idx in indices_to_convert:
+        if idx < 0 or idx >= num_chunks:
+            raise ValueError(f"Invalid chunk index {idx}. Must be between 0 and {num_chunks - 1}")
+
     # Convert each chunk
-    print(f"\n[4] Converting {num_chunks} chunks...")
+    print(f"\n[4] Converting {len(indices_to_convert)} chunk(s)...")
     chunk_models = []
 
-    for chunk_idx, (start_layer, end_layer) in enumerate(chunk_ranges):
+    for chunk_idx in indices_to_convert:
+        start_layer, end_layer = chunk_ranges[chunk_idx]
         is_last_chunk = (chunk_idx == num_chunks - 1)
 
         chunk_mlmodel, _ = convert_single_chunk(
@@ -809,27 +890,45 @@ def convert_chunked_language_model(
             seq_len,
             is_last_chunk,
             output_path,
+            skip_model_load=skip_model_load,
         )
-        chunk_models.append(chunk_mlmodel)
+        if chunk_mlmodel is not None:
+            chunk_models.append(chunk_mlmodel)
 
         # Optional analysis per chunk
         if analyze_compute or analyze_mil:
             print(f"\n    Analyzing chunk {chunk_idx}...")
             run_model_analysis(chunk_mlmodel, analyze_compute, analyze_mil)
 
+        # Memory cleanup after each chunk
+        gc.collect()
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+
     # Verification
     print("\n" + "=" * 60)
     print("[5] VERIFICATION")
     print("=" * 60)
 
-    e2e_result = verify_chunked_model(
-        chunk_models,
-        chunk_ranges,
-        ctx.original_model,
-        batch_size,
-        ctx.hidden_dim,
-        seq_len,
-    )
+    e2e_result = None
+    if skip_verification:
+        print("    Skipped (--skip-verification flag set)")
+    elif skip_model_load:
+        print("    Skipped (--skip-model-load flag set, models not loaded)")
+    elif chunk_indices and len(chunk_indices) != num_chunks:
+        print("    Skipped (not all chunks were converted)")
+        print("    Run without --chunk-index to verify all chunks together")
+    elif ctx.reference_output is None:
+        print("    Skipped (reference output not available)")
+    elif not chunk_models:
+        print("    Skipped (no models available for verification)")
+    else:
+        e2e_result = verify_chunked_model(
+            chunk_models,
+            ctx.reference_output,
+            ctx.reference_input_cf,
+            seq_len,
+        )
 
     # Summary
     print("\n" + "=" * 60)
@@ -839,11 +938,15 @@ def convert_chunked_language_model(
     print(f"Architecture: {ctx.model_type}")
     print(f"Total layers: {total_layers}")
     print(f"Number of chunks: {num_chunks}")
+    print(f"Chunks converted: {indices_to_convert}")
     print(f"Output directory: {output_dir}")
-    print("\nChunk files:")
-    for i in range(num_chunks):
+    print("\nChunk files created:")
+    for i in indices_to_convert:
         print(f"  - chunk_{i}.mlpackage")
-    print(f"\nEnd-to-end verification: {'PASSED' if e2e_result.passed else 'FAILED'}")
+    if e2e_result is not None:
+        print(f"\nEnd-to-end verification: {'PASSED' if e2e_result.passed else 'FAILED'}")
+    else:
+        print("\nEnd-to-end verification: SKIPPED")
 
     return chunk_models
 
@@ -867,6 +970,13 @@ Examples:
 
     # Convert large model in 4 chunks (for models > 2GB)
     python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4
+
+    # Convert only specific chunks to reduce memory usage
+    python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4 --chunk-index 0
+    python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4 --chunk-index 1,2
+
+    # Minimum memory mode: one chunk at a time, skip model load
+    python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4 --chunk-index 0 --skip-model-load
 
     # Quick debug with only 8 layers split into 2 chunks
     python examples/lm_conversion_example.py --num-layers 8 --num-chunks 2
@@ -959,12 +1069,41 @@ Examples:
         help="Skip main model conversion and only export embeddings/LM head. "
         "Must be used with --export-embeddings and/or --export-lm-head.",
     )
+    parser.add_argument(
+        "--chunk-index",
+        type=str,
+        default=None,
+        help="Convert only specific chunk(s). Can be a single index (e.g., '0') or "
+        "comma-separated indices (e.g., '0,1,2'). Use with --num-chunks to specify "
+        "total chunks. This reduces memory usage by not loading chunks you don't need.",
+    )
+    parser.add_argument(
+        "--skip-verification",
+        action="store_true",
+        help="Skip output verification step. This reduces memory usage by not keeping "
+        "a copy of the original model for comparison.",
+    )
+    parser.add_argument(
+        "--skip-model-load",
+        action="store_true",
+        help="Skip loading the model after conversion. Reduces memory usage and allows "
+        "converting newer model formats on older macOS versions. The model can still be "
+        "saved but cannot be used for prediction in the same session.",
+    )
 
     args = parser.parse_args()
 
     # Validate arguments
     if args.components_only and not (args.export_embeddings or args.export_lm_head):
         parser.error("--components-only requires --export-embeddings and/or --export-lm-head")
+
+    # Parse chunk indices if provided
+    chunk_indices = None
+    if args.chunk_index:
+        try:
+            chunk_indices = [int(x.strip()) for x in args.chunk_index.split(",")]
+        except ValueError:
+            parser.error(f"Invalid --chunk-index value: {args.chunk_index}. Must be integers separated by commas.")
 
     # Convert main model (unless components-only mode)
     if not args.components_only and args.num_chunks > 1:
@@ -978,6 +1117,9 @@ Examples:
             verbose=not args.quiet,
             analyze_compute=args.analyze_compute_plan,
             analyze_mil=args.analyze_mil,
+            chunk_indices=chunk_indices,
+            skip_verification=args.skip_verification,
+            skip_model_load=args.skip_model_load,
         )
     elif not args.components_only:
         convert_language_model(
@@ -989,6 +1131,7 @@ Examples:
             verbose=not args.quiet,
             analyze_compute=args.analyze_compute_plan,
             analyze_mil=args.analyze_mil,
+            skip_model_load=args.skip_model_load,
         )
 
     # Export embeddings and/or LM head if requested
