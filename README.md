@@ -10,6 +10,13 @@ This library provides utilities to convert HuggingFace transformer models to Cor
 uv sync
 ```
 
+## Pre-converted Models
+
+| Model | Input Length | Context Length | Link |
+|-------|--------------|----------------|------|
+| Qwen3-1.7B | 8 | 2048 | [seba/Qwen3-1.7B-CoreML-input-8-ctx-2048](https://huggingface.co/seba/Qwen3-1.7B-CoreML-input-8-ctx-2048) |
+| Qwen3-4B-Instruct-2507 | 8 | 2048 | [seba/Qwen3-4B-Instruct-2507-CoreML-input-8-ctx-2048](https://huggingface.co/seba/Qwen3-4B-Instruct-2507-CoreML-input-8-ctx-2048) |
+
 ## Model Conversion
 
 Convert a model with embeddings and LM head export:
