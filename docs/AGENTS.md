@@ -668,6 +668,51 @@ This keeps the computation graph cleaner and avoids potential inefficiencies on 
 
 **Neural Engine Model Size Limit (~2GB):** Apple's Neural Engine can only load models up to approximately 2GB. For larger models (e.g., Qwen3-4B with 4 billion parameters), you must split the model into multiple chunks.
 
+## Compiled CoreML Models (.mlmodelc)
+
+When CoreML loads an `.mlpackage`, it compiles it to an optimized `.mlmodelc` format in a temporary directory. This compilation includes device-specific optimizations and can take significant time for large models. The compiled model is deleted when the Python process ends.
+
+**The caching solution:** Save the compiled `.mlmodelc` alongside the `.mlpackage` for faster subsequent loads.
+
+### .mlmodelc Directory Structure
+
+```
+model.mlmodelc/
+├── coremldata.bin      # Protobuf: input/output/state specs and metadata
+├── model.mil           # MIL program (text format)
+├── weights/
+│   └── weight.bin      # Model weights
+└── analytics/
+    └── coremldata.bin  # Analytics: model hash, name
+```
+
+### coremldata.bin Format
+
+The main `coremldata.bin` contains a header followed by protobuf-encoded descriptors:
+
+- **Field 1** = Input descriptors (name, shape, dtype)
+- **Field 10** = Output descriptors (name, shape, dtype)
+- **Field 13** = State descriptors (name, shape for KV cache)
+- **Field 100** = Metadata (coremltools version, source, conversion date)
+
+This file is parsed by `parse_coremldata_bin()` in `inference.py` to extract input shapes when loading `CompiledMLModel` (which lacks the `get_spec()` method available on `MLModel`).
+
+### Using Compiled Models
+
+```python
+import coremltools as ct
+
+# Standard loading (compiles to temp directory, deleted on exit)
+model = ct.models.MLModel("model.mlpackage")
+
+# Load pre-compiled model (faster, no compilation needed)
+model = ct.models.CompiledMLModel("model.mlmodelc")
+
+# Cache compiled model for reuse
+compiled_path = model.get_compiled_model_path()  # Temp location
+shutil.copytree(compiled_path, "model.mlmodelc")  # Save permanently
+```
+
 ## Language Model Conversion and Inference
 
 For full language model workflows:
@@ -683,8 +728,14 @@ uv run python examples/lm_conversion_example.py --model Qwen/Qwen2-0.5B --export
 # Convert large model (chunked, memory-efficient)
 uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B --num-chunks 4 --chunk-index 0 --skip-model-load
 
+# Convert with compiled model caching (faster subsequent inference)
+uv run python examples/lm_conversion_example.py --model Qwen/Qwen2-0.5B --export-embeddings --export-lm-head --cache-compiled
+
 # Run inference
 uv run python examples/inference.py --model-dir ./model --model-name Qwen/Qwen2-0.5B
+
+# Run inference with compiled model caching
+uv run python examples/inference.py --model-dir ./model --model-name Qwen/Qwen2-0.5B --cache-compiled
 ```
 
 ## Development Workflow

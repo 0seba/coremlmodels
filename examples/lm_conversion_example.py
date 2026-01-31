@@ -51,12 +51,16 @@ Usage:
 
     # Enable compute plan and MIL analysis
     uv run python examples/lm_conversion_example.py --analyze-compute-plan --analyze-mil
+
+    # Cache compiled models for faster subsequent loads
+    uv run python examples/lm_conversion_example.py --cache-compiled
 """
 
 import argparse
 import copy
 import gc
 import math
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
@@ -66,6 +70,52 @@ import torch
 import torch.nn as nn
 import coremltools as ct
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+
+
+# =============================================================================
+# Compiled Model Caching Utilities
+# =============================================================================
+
+
+def get_compiled_model_path(mlpackage_path: Path) -> Path:
+    """Get the compiled model path (.mlmodelc) corresponding to an .mlpackage.
+
+    The compiled model is stored in the same directory as the .mlpackage,
+    with the same name but .mlmodelc extension.
+
+    Args:
+        mlpackage_path: Path to the .mlpackage file/directory
+
+    Returns:
+        Path to the corresponding .mlmodelc directory
+    """
+    return mlpackage_path.with_suffix(".mlmodelc")
+
+
+def cache_compiled_model(mlmodel, mlpackage_path: Path, verbose: bool = True) -> Path:
+    """Cache the compiled model (.mlmodelc) to the same directory as the .mlpackage.
+
+    CoreML compiles models to a temporary location. This function copies
+    the compiled model to a persistent location for faster subsequent loads.
+
+    Args:
+        mlmodel: The loaded MLModel object
+        mlpackage_path: Path to the .mlpackage file/directory
+        verbose: Print progress information
+
+    Returns:
+        Path to the cached .mlmodelc directory
+    """
+    compiled_path = get_compiled_model_path(mlpackage_path)
+    temp_compiled_path = mlmodel.get_compiled_model_path()
+
+    if verbose:
+        print(f"    Caching compiled model to: {compiled_path}")
+
+    # Copy the compiled model directory
+    shutil.copytree(temp_compiled_path, str(compiled_path), dirs_exist_ok=True)
+
+    return compiled_path
 
 from coremlmodels import (
     analyze_compute_plan,
@@ -460,6 +510,7 @@ def convert_language_model(
     analyze_compute: bool = False,
     analyze_mil: bool = False,
     skip_model_load: bool = False,
+    cache_compiled: bool = False,
 ):
     """Convert a HuggingFace language model to CoreML.
 
@@ -474,6 +525,7 @@ def convert_language_model(
         analyze_compute: Run compute plan analysis.
         analyze_mil: Run MIL program inspection.
         skip_model_load: Skip loading model after conversion to reduce memory.
+        cache_compiled: Cache compiled model (.mlmodelc) for faster subsequent loads.
 
     Returns:
         Converted CoreML model (None if skip_model_load is True).
@@ -546,6 +598,11 @@ def convert_language_model(
         skip_model_load=skip_model_load,
     )
     print(f"    Saved to: {output_path}")
+
+    # Cache compiled model if requested
+    if cache_compiled and not skip_model_load and mlmodel is not None:
+        print("\n[5.5] Caching compiled model...")
+        cache_compiled_model(mlmodel, Path(output_path), verbose)
 
     # Verification
     print("\n[6] Verifying outputs...")
@@ -625,11 +682,13 @@ def convert_single_chunk(
     is_last_chunk: bool,
     output_path: Path,
     skip_model_load: bool = False,
+    cache_compiled: bool = False,
 ):
     """Convert a single chunk to CoreML.
 
     Args:
         skip_model_load: Skip loading model after conversion to reduce memory.
+        cache_compiled: Cache compiled model (.mlmodelc) for faster subsequent loads.
 
     Returns:
         Tuple of (chunk_mlmodel, chunk_wrapper). chunk_mlmodel is None if skip_model_load is True.
@@ -703,6 +762,10 @@ def convert_single_chunk(
         skip_model_load=skip_model_load,
     )
     print(f"    Saved to: {chunk_path}")
+
+    # Cache compiled model if requested
+    if cache_compiled and not skip_model_load and chunk_mlmodel is not None:
+        cache_compiled_model(chunk_mlmodel, chunk_path, verbose=True)
 
     return chunk_mlmodel, chunk_wrapper
 
@@ -779,6 +842,7 @@ def convert_chunked_language_model(
     chunk_indices: list[int] | None = None,
     skip_verification: bool = False,
     skip_model_load: bool = False,
+    cache_compiled: bool = False,
 ):
     """Convert a HuggingFace language model to multiple CoreML chunks.
 
@@ -796,6 +860,7 @@ def convert_chunked_language_model(
         chunk_indices: List of specific chunk indices to convert. If None, converts all.
         skip_verification: Skip output verification to reduce memory usage.
         skip_model_load: Skip loading model after conversion to reduce memory.
+        cache_compiled: Cache compiled models (.mlmodelc) for faster subsequent loads.
 
     Returns:
         List of converted CoreML models (empty if skip_model_load is True).
@@ -891,6 +956,7 @@ def convert_chunked_language_model(
             is_last_chunk,
             output_path,
             skip_model_load=skip_model_load,
+            cache_compiled=cache_compiled,
         )
         if chunk_mlmodel is not None:
             chunk_models.append(chunk_mlmodel)
@@ -1090,6 +1156,13 @@ Examples:
         "converting newer model formats on older macOS versions. The model can still be "
         "saved but cannot be used for prediction in the same session.",
     )
+    parser.add_argument(
+        "--cache-compiled",
+        action="store_true",
+        help="Cache compiled models (.mlmodelc) alongside .mlpackage files for faster "
+        "subsequent loads. The compiled model is saved in the same directory with "
+        ".mlmodelc extension. Requires model loading (incompatible with --skip-model-load).",
+    )
 
     args = parser.parse_args()
 
@@ -1104,6 +1177,10 @@ Examples:
             chunk_indices = [int(x.strip()) for x in args.chunk_index.split(",")]
         except ValueError:
             parser.error(f"Invalid --chunk-index value: {args.chunk_index}. Must be integers separated by commas.")
+
+    # Validate cache_compiled with skip_model_load
+    if args.cache_compiled and args.skip_model_load:
+        parser.error("--cache-compiled cannot be used with --skip-model-load (model must be loaded to cache)")
 
     # Convert main model (unless components-only mode)
     if not args.components_only and args.num_chunks > 1:
@@ -1120,6 +1197,7 @@ Examples:
             chunk_indices=chunk_indices,
             skip_verification=args.skip_verification,
             skip_model_load=args.skip_model_load,
+            cache_compiled=args.cache_compiled,
         )
     elif not args.components_only:
         convert_language_model(
@@ -1132,6 +1210,7 @@ Examples:
             analyze_compute=args.analyze_compute_plan,
             analyze_mil=args.analyze_mil,
             skip_model_load=args.skip_model_load,
+            cache_compiled=args.cache_compiled,
         )
 
     # Export embeddings and/or LM head if requested
@@ -1201,7 +1280,7 @@ Examples:
                     lm_head = None
 
                 if lm_head is not None:
-                    convert_lm_head(
+                    lm_head_mlmodel = convert_lm_head(
                         lm_head=lm_head,
                         batch_size=1,
                         hidden_dim=config.hidden_size,
@@ -1213,6 +1292,9 @@ Examples:
                         analyze_compute=args.analyze_compute_plan,
                         analyze_mil=args.analyze_mil,
                     )
+                    # Cache compiled model if requested
+                    if args.cache_compiled and lm_head_mlmodel is not None:
+                        cache_compiled_model(lm_head_mlmodel, lm_head_path, verbose=not args.quiet)
             except Exception as e:
                 print(f"  [ERROR] Failed to load or convert LM head: {e}")
 

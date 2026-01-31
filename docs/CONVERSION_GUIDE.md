@@ -117,6 +117,23 @@ uv run python examples/lm_conversion_example.py \
 
 Run separately for each chunk index (0, 1, 2, 3).
 
+### Option 4: Cache Compiled Models
+
+Cache the compiled `.mlmodelc` files for faster subsequent loads during inference:
+
+```bash
+uv run python examples/lm_conversion_example.py \
+    --model Qwen/Qwen3-4B \
+    --num-chunks 4 \
+    --export-embeddings \
+    --export-lm-head \
+    --cache-compiled
+```
+
+This saves the compiled models alongside the `.mlpackage` files, significantly reducing load time for inference. See [INFERENCE_GUIDE.md](INFERENCE_GUIDE.md) for details on using cached models.
+
+**Note**: `--cache-compiled` requires model loading (incompatible with `--skip-model-load`).
+
 ## CLI Arguments Reference
 
 | Argument | Default | Description |
@@ -130,6 +147,7 @@ Run separately for each chunk index (0, 1, 2, 3).
 | `--chunk-index` | all | Specific chunk(s) to convert |
 | `--skip-verification` | false | Skip output verification |
 | `--skip-model-load` | false | Don't load model after conversion |
+| `--cache-compiled` | false | Cache compiled models (.mlmodelc) |
 | `--export-embeddings` | false | Export embeddings as .npy |
 | `--export-lm-head` | false | Export LM head as CoreML |
 | `--lm-head-chunk-size` | `6144` | Vocab chunk size for LM head |

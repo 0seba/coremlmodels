@@ -58,6 +58,7 @@ qwen3_4b_chunked_4/
 | `--chunked` | false | Use chunked model |
 | `--num-chunks` | 1 | Number of model chunks |
 | `--max-context-length` | auto | Maximum KV cache size |
+| `--cache-compiled` | false | Cache compiled models for faster loads |
 | `--temperature` | 0.8 | Sampling temperature |
 | `--top-k` | 40 | Top-k filtering (0 = disabled) |
 | `--top-p` | 0.95 | Nucleus sampling threshold |
@@ -294,3 +295,55 @@ When the cache fills up:
 - In single prompt mode: generation stops
 
 Use `/reset` proactively when context is getting full.
+
+## Compiled Model Caching
+
+CoreML compiles `.mlpackage` models to optimized `.mlmodelc` format on first load. This compilation can take significant time for large models. The `--cache-compiled` flag saves these compiled models for faster subsequent loads.
+
+### How It Works
+
+1. **First run with `--cache-compiled`**: Models are loaded from `.mlpackage`, compiled, and the compiled `.mlmodelc` is saved alongside
+2. **Subsequent runs**: Compiled models are detected and loaded directly (much faster)
+
+### Usage
+
+```bash
+# First run: compiles and caches
+uv run python examples/inference.py \
+    --model-dir ./qwen3_4b_chunked_4 \
+    --model-name Qwen/Qwen3-4B \
+    --chunked --num-chunks 4 \
+    --cache-compiled
+
+# Subsequent runs: loads cached compiled models (faster)
+uv run python examples/inference.py \
+    --model-dir ./qwen3_4b_chunked_4 \
+    --model-name Qwen/Qwen3-4B \
+    --chunked --num-chunks 4
+```
+
+### Cached File Structure
+
+After caching, your model directory will contain:
+
+```
+qwen3_4b_chunked_4/
+├── chunk_0.mlpackage        # Original model
+├── chunk_0.mlmodelc/        # Cached compiled model
+├── chunk_1.mlpackage
+├── chunk_1.mlmodelc/
+├── ...
+├── lm_head.mlpackage
+├── lm_head.mlmodelc/
+└── embeddings.npy
+```
+
+### Automatic Detection
+
+The inference script automatically detects cached compiled models. If a `.mlmodelc` exists alongside a `.mlpackage`, it will be used automatically (no `--cache-compiled` flag needed).
+
+### Notes
+
+- Compiled models are device-specific and may need regeneration on different hardware
+- The `.mlmodelc` directories can be safely deleted to force recompilation
+- Caching applies to the main model chunks and LM head
