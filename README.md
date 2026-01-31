@@ -37,6 +37,13 @@ uv run python examples/inference.py --model-dir ./qwen3_4b_instruct_2507/ --mode
 - Qwen2
 - Qwen3
 
+## Limitations
+
+- **Fixed cache length**: KV cache size is set at conversion time and cannot be changed at runtime
+- **Fixed sequence length**: Input sequence length is fixed for both prompt processing and token generation. CoreML multifunction models can address this by providing separate functions for different sequence lengths
+- **Model size limit (~2GB)**: Neural Engine can only load models up to ~2GB, requiring chunked conversion for larger models
+- **FP16 precision**: Computations run in FP16, which may affect numerical precision for some operations
+
 ## Documentation
 
 For technical details, implementation guides, and development workflows, see [docs/AGENTS.md](docs/AGENTS.md).
