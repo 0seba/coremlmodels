@@ -60,6 +60,22 @@ x = torch.randn(2, 1024)  # Will fail!
 x_4d = x.view(x.size(0), x.size(1), 1, 1)
 ```
 
+### Patch-Level Padding vs. Spatial Padding (Vision Models)
+
+For vision transformers (like GLM-OCR), input images often have variable aspect ratios. Standard "spatial padding" (padding image to fixed HxW) adds a level of difficulty to reach equivalence if working with overlaping patches (convolutions with strides smaller than the kernel size).
+
+**The Solution: Flattened Patch Sequence with Enumerated Shapes**
+Instead of padding pixels, we specificy the **number of patches** as the dynamic dimension:
+1.  **Conv3d Patch Embeddings**: Convert image patches to embeddings independently.
+2.  **Flatten**: Reshape to `(num_patches, channels)` sequence.
+3.  **Pad Sequence**: Pad the *sequence length* (`num_patches`) to the nearest enumerated size (e.g., 32, 64, ..., 16384).
+
+**Why this works on Neural Engine:**
+-   **Conv2d on 1D Sequence**: By reshaping `(1, C, 1, N)` (where N is patches), 1x1 convolutions process the sequence efficiently.
+-   **Unified Architecture**: Supports any aspect ratio without changing the compute graph structure.
+
+This approach was successfully used for the **GLM-OCR** vision model conversion.
+
 ### 1x1 Conv2d Instead of Linear
 
 ANE favors 4D tensors in channels-first format (NCHW). The solution: wrap the Linear layer in a patcher that performs 1x1 convolution.
@@ -437,6 +453,58 @@ patched = patch_model_attention(patched, target_classes=attention_classes, confi
 ```
 
 
+
+### Dynamic Int Ops and Tracing Pitfalls (GENERAL RULE)
+
+**NEVER use tensor values to compute shape/slice indices inside a traced model.**
+
+When tracing with `torch.jit.trace`, operations like `x.size(dim) // 2` where `dim` is a tensor dimension are recorded as **Tensor operations**, not Python integers.
+
+**The Problem:**
+-   The tracer records `size()` as a Tensor.
+-   The `// 2` becomes a `floor_divide` op on Tensors.
+-   Later, when used as an index/slice (e.g., `x[:, :mid]`), CoreML fails because it expects a static integer index, not a computed tensor scalar.
+-   **Error:** `TypeError: only 0-dimensional arrays can be converted to Python scalars`
+
+**The Fix:**
+Compute all shape-dependent constants **outside the model** or pass them as Python integers/arguments that are resolved *before* tracing.
+
+**BAD (Dynamic Int Op):**
+```python
+def forward(self, x):
+    # x.shape is dynamic during tracing
+    mid = x.shape[-1] // 2  # Creates a Tensor op!
+    return x[..., :mid]     # Fails in CoreML conversion
+```
+
+**GOOD (Static Integer):**
+```python
+def forward(self, x):
+    # self.head_dim is a Python int stored in __init__
+    mid = self.head_dim // 2  # Pure Python int
+    return x[..., :mid]       # Works perfectly
+```
+
+### Avoiding Relative Imports in Model Code
+
+**DO NOT use relative imports (e.g., `from .. import utils`) in model files you intend to convert.**
+
+When loading custom models (like `trust_remote_code=True` models from HuggingFace), the file structure is effectively flattened or executed in a different context.
+
+**The Problem:**
+-   `from . import submodule` works if the package structure is preserved.
+-   But when `torch.jit.trace` or `coremltools` analyzes the code, or when running independent scripts, these relative imports often fail with `ImportError: attempted relative import beyond top-level package`.
+
+**The Solution:**
+1.  **Self-contained files:** Copy necessary utility classes/functions into the model file itself.
+2.  **Dynamic Inspection:** Instead of importing a class to check `isinstance(m, SomeClass)`, inspect the class name string:
+    ```python
+    # BAD: from .modeling_custom import CustomRMSNorm
+    # if isinstance(layer, CustomRMSNorm): ...
+
+    # GOOD:
+    if "RMSNorm" in layer.__class__.__name__: ...
+    ```
 
 ## Complete Example: Patch and Convert
 

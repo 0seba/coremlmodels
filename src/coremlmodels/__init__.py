@@ -27,6 +27,17 @@ from .registry import (
     get_architecture_config,
     get_supported_architectures,
 )
+from .vision_model_wrapper import (
+    ENUMERATED_PATCH_COUNTS,
+    VisionAttentionPatcher,
+    VisionBlockPatcher,
+    VisionModelWrapper,
+    compute_vision_rotary_pos_emb,
+    create_padding_attention_mask,
+    create_patch_mask,
+    get_best_patch_count,
+    patch_vision_blocks,
+)
 
 __all__ = [
     # Linear patching
@@ -61,4 +72,14 @@ __all__ = [
     "inspect_mil_program",
     # Graph passes
     "register_extended_passes",
+    # Vision model wrapper
+    "ENUMERATED_PATCH_COUNTS",
+    "VisionAttentionPatcher",
+    "VisionBlockPatcher",
+    "VisionModelWrapper",
+    "compute_vision_rotary_pos_emb",
+    "create_padding_attention_mask",
+    "create_patch_mask",
+    "get_best_patch_count",
+    "patch_vision_blocks",
 ]
