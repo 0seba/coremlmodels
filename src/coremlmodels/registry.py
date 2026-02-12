@@ -52,6 +52,11 @@ ARCHITECTURE_REGISTRY: Dict[str, ArchitectureConfig] = {
         rmsnorm_class_names=("Qwen3RMSNorm",),
         has_qk_norm=True,
     ),
+    "glm_ocr": ArchitectureConfig(
+        attention_class_names=("GlmOcrTextAttention",),
+        rmsnorm_class_names=("GlmOcrRMSNorm",),
+        has_qk_norm=False,
+    ),
 }
 
 

@@ -2,7 +2,7 @@
 
 This module provides a wrapper for vision transformer models that:
 1. Takes pre-extracted patches (padded to an enumerated count) as input
-2. Applies patch embedding (Conv3d)
+2. Applies patch embedding (Conv2d, converted from Conv3d)
 3. Uses pre-computed 2D rotary position embeddings passed as input
 4. Applies attention masking for padded patches
 5. Runs transformer blocks, downsample, and patch merger
@@ -10,6 +10,10 @@ This module provides a wrapper for vision transformer models that:
 Key design: patches are padded at the patch level (not spatially), so the
 model's flexible shape dimension is the number of patches. This allows a
 single enumerated shape to serve multiple image aspect ratios.
+
+The original Conv3d patch embedding with kernel (2,14,14) is converted to
+a Conv2d with kernel (14,14) by folding the temporal dimension into the
+channel dimension (3 channels × 2 temporal = 6 input channels).
 
 No CoreML state is needed — vision encoding is a single forward pass.
 """
@@ -28,19 +32,19 @@ import torch.nn as nn
 # Max patches: capped at 16384 (CoreML dimension limit)
 # 32 values with roughly geometric spacing, all multiples of 4
 ENUMERATED_PATCH_COUNTS = [
-    32,
-    48,
-    64,
-    96,
+    # 32,
+    # 48,
+    # 64,
+    # 96,
     128,
-    176,
-    240,
-    320,
-    432,
+    # 176,
+    # 240,
+    # 320,
+    # 432,
     576,
-    768,
+    # 768,
     1024,
-    1344,
+    # 1344,
     1792,
     2368,
     3072,
@@ -318,15 +322,16 @@ class VisionModelWrapper(nn.Module):
 
     This wrapper:
     - Takes pre-chunked patches as input (padded to enumerated count)
-    - Applies Conv3d patch embedding
+    - Applies Conv2d patch embedding (converted from Conv3d)
     - Zeros out padding patch embeddings using a mask
     - Runs transformer blocks with attention masking
     - Applies post-layernorm, downsample (Conv2d), and patch merger
     - Outputs full sequence (host extracts real tokens)
 
     Inputs:
-        pixel_patches: (num_patches, in_channels, temporal_patch_size, patch_h, patch_w)
-            Pre-chunked patches in Conv3d-ready shape. Padding patches are zeros.
+        pixel_patches: (num_patches, in_channels * temporal_patch_size, patch_h, patch_w)
+            Pre-chunked patches with temporal dim folded into channels.
+            E.g. (N, 6, 14, 14) for 3 channels × 2 temporal. Padding patches are zeros.
         position_cos: (num_patches, head_dim)
             Pre-computed 2D RoPE cosine embeddings for real patches
             (padding patches get arbitrary values since they're masked).
@@ -352,8 +357,32 @@ class VisionModelWrapper(nn.Module):
 
         config = vision_model.config
 
+        # Patch embedding — replace Conv3d with Conv2d
+        # Conv3d kernel (2,14,14) stride (2,14,14) is non-overlapping:
+        # input (N, 3, 2, 14, 14) → fold temporal into channels → (N, 6, 14, 14)
+        conv3d = vision_model.patch_embed.proj
+        conv2d = nn.Conv2d(
+            in_channels=config.in_channels * config.temporal_patch_size,  # 3*2=6
+            out_channels=config.hidden_size,
+            kernel_size=config.patch_size,  # 14
+            stride=config.patch_size,  # 14
+            bias=conv3d.bias is not None,
+        )
+        # Reshape weights: (out_ch, 3, 2, 14, 14) → (out_ch, 6, 14, 14)
+        with torch.no_grad():
+            conv2d.weight.copy_(
+                conv3d.weight.reshape(
+                    config.hidden_size,
+                    config.in_channels * config.temporal_patch_size,
+                    config.patch_size,
+                    config.patch_size,
+                )
+            )
+            if conv3d.bias is not None:
+                conv2d.bias.copy_(conv3d.bias)
+        self.patch_embed_proj = conv2d
+
         # Store sub-modules
-        self.patch_embed = vision_model.patch_embed
         self.blocks = vision_model.blocks
         self.post_layernorm = vision_model.post_layernorm
         self.downsample = vision_model.downsample
@@ -363,18 +392,9 @@ class VisionModelWrapper(nn.Module):
         self.hidden_size = config.hidden_size
         self.out_hidden_size = config.out_hidden_size
         self.spatial_merge_size = config.spatial_merge_size
-        self.in_channels = config.in_channels
-        self.temporal_patch_size = config.temporal_patch_size
-        self.patch_size = config.patch_size
         self.channels_first = channels_first
 
         # Derived
-        self.patch_volume = (
-            self.in_channels
-            * self.temporal_patch_size
-            * self.patch_size
-            * self.patch_size
-        )
         self.num_heads = config.num_heads
         self.head_dim = self.hidden_size // self.num_heads
 
@@ -389,8 +409,9 @@ class VisionModelWrapper(nn.Module):
         """Forward pass.
 
         Args:
-            pixel_patches: (num_patches, in_channels, temporal, patch_h, patch_w)
-                Already shaped for Conv3d. Padding patches are zeros.
+            pixel_patches: (num_patches, in_channels * temporal, patch_h, patch_w)
+                4D input with temporal folded into channels. E.g. (N, 6, 14, 14).
+                Padding patches are zeros.
             position_cos: (num_patches, head_dim) — 2D RoPE cos.
             position_sin: (num_patches, head_dim) — 2D RoPE sin.
             attention_mask: (1, 1, num_patches, num_patches) — attention mask.
@@ -399,14 +420,11 @@ class VisionModelWrapper(nn.Module):
         Returns:
             (1, out_hidden_size, 1, num_merged_tokens) — vision embeddings.
         """
-        # --- Patch Embedding ---
-        # Input already Conv3d-ready: (num_patches, in_channels, temporal, h, w)
-        hidden_states = self.patch_embed.proj(pixel_patches)
-        # Conv3d output: (num_patches, hidden_size, 1, 1, 1)
-        # → (1, hidden_size, 1, num_patches) channels-first
-        hidden_states = hidden_states.view(
-            -1, self.hidden_size
-        )  # (num_patches, hidden_size)
+        # --- Patch Embedding (Conv2d) ---
+        # pixel_patches: (N, 6, 14, 14) — temporal already folded into channels
+        hidden_states = self.patch_embed_proj(pixel_patches)
+        # Conv2d output: (N, hidden_size, 1, 1) → flatten to (N, hidden_size)
+        hidden_states = hidden_states.view(-1, self.hidden_size)
         hidden_states = hidden_states.unsqueeze(0).permute(0, 2, 1).unsqueeze(2)
         # Now: (1, hidden_size, 1, num_patches)
 
@@ -426,33 +444,18 @@ class VisionModelWrapper(nn.Module):
         hidden_states = self.post_layernorm(hidden_states)
 
         # --- Downsample ---
-        # Current: (1, hidden_size, 1, num_patches)
-        # Need to reshape to (num_groups, hidden_size, merge, merge)
-        # where num_groups = num_patches / merge^2
-        merge = self.spatial_merge_size
+        # Reshape to (N/4, C, 2, 2) batched 2×2 patches
+        num_groups = hidden_states.shape[-1] // 4
+        x_flat = hidden_states.view(self.hidden_size, -1).permute(1, 0)
+        x_2d = x_flat.view(num_groups, 2, 2, self.hidden_size).permute(0, 3, 1, 2)
 
-        # Reshape: (1, hidden_size, 1, num_patches) → (1, num_patches, hidden_size)
-        hidden_states = hidden_states.squeeze(2).permute(0, 2, 1)
-        # → (num_groups, merge, merge, hidden_size) → (num_groups, hidden_size, merge, merge)
-        hidden_states = hidden_states.view(-1, merge, merge, self.hidden_size)
-        hidden_states = hidden_states.permute(0, 3, 1, 2)
-
-        hidden_states = self.downsample(
-            hidden_states
-        )  # (num_groups, out_hidden_size, 1, 1)
-
-        # Reshape to channels-first for merger (Conv2d-patched linears need 4D)
-        # (num_groups, out_hidden_size, 1, 1) → (1, out_hidden_size, 1, num_groups)
-        hidden_states = hidden_states.squeeze(-1).squeeze(
-            -1
-        )  # (num_groups, out_hidden_size)
-        hidden_states = hidden_states.unsqueeze(0).permute(0, 2, 1).unsqueeze(2)
+        downsampled = self.downsample(x_2d)  # (num_groups, out_hidden_size, 1, 1)
 
         # --- Patch Merger ---
-        # Merger's Linear layers are patched to Conv2d, so input stays 4D
-        merged = self.merger(hidden_states)  # (1, out_hidden_size, 1, num_groups)
+        merged = self.merger(downsampled)  # (num_groups, out_hidden_size, 1, 1)
+        output = merged.view(1, self.out_hidden_size, 1, num_groups)
 
-        return merged
+        return output
 
     def __repr__(self) -> str:
         num_blocks = len(self.blocks)
@@ -463,8 +466,6 @@ class VisionModelWrapper(nn.Module):
             f"    num_heads={self.num_heads},\n"
             f"    head_dim={self.head_dim},\n"
             f"    num_blocks={num_blocks},\n"
-            f"    patch_size={self.patch_size},\n"
-            f"    temporal_patch_size={self.temporal_patch_size},\n"
             f"    spatial_merge_size={self.spatial_merge_size},\n"
             f"    channels_first={self.channels_first},\n"
             f")"

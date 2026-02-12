@@ -4,6 +4,7 @@ This script converts the GLM-OCR vision encoder to CoreML with:
 - Patch-level padding (not spatial) for flexible input sizes
 - 32 enumerated patch counts from 32 to 16,384
 - 2D rotary position embeddings pre-computed on host
+- Conv2d patch embedding (converted from original Conv3d)
 - Attention masking for padded patches
 - No CoreML state needed (single forward pass)
 
@@ -22,6 +23,7 @@ Usage:
 """
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -54,7 +56,7 @@ from coremlmodels.vision_model_wrapper import (
 
 
 def load_vision_model(
-    model_name: str = "seba/GLM-OCR",
+    model_name: str = "zai-org/GLM-OCR",
     num_layers: int | None = None,
     verbose: bool = True,
 ):
@@ -85,11 +87,13 @@ def load_vision_model(
         print(f"    spatial_merge_size: {vision_config.spatial_merge_size}")
         print(f"    in_channels: {vision_config.in_channels}")
 
-    # Limit layers for debugging
-    if num_layers is not None:
-        original_depth = vision_config.depth
+    # Limit layers for debugging (None or -1 means all layers)
+    original_depth = vision_config.depth
+    if num_layers is not None and num_layers != -1:
         vision_config.depth = min(num_layers, original_depth)
         print(f"  ⚠ Limiting to {vision_config.depth}/{original_depth} layers")
+    else:
+        print(f"  Using all {original_depth} layers")
 
     print("  Loading model weights...")
     model = AutoModel.from_pretrained(
@@ -156,68 +160,105 @@ def patch_vision_model(
     patch_vision_blocks(vision_model, verbose=verbose)
 
 
-# =============================================================================
-# Reference Output
-# =============================================================================
-
-
-def compute_reference_output(
+def run_original_vision_model(
     vision_model: nn.Module,
-    num_patches: int,
+    num_real_patches: int,
+    num_total_patches: int,
     vision_config: object,
 ) -> tuple:
-    """Compute reference output from the original (unpatched) vision model.
+    """Run the original (unpatched) vision model to get ground-truth output.
 
-    Creates a synthetic input with the specified number of patches and
-    runs the original model to get reference outputs for verification.
+    This is the true reference — no wrapping, no patching, no conversion.
+    We generate random pixel data, run it through the original model, and
+    return the output alongside the same data reformatted for CoreML input.
 
     Args:
         vision_model: Original, unpatched vision model.
-        num_patches: Number of patches to use.
+        num_real_patches: Number of real (non-padding) patches.
+        num_total_patches: Total patches including padding (for CoreML input).
         vision_config: Vision config.
 
     Returns:
-        Tuple of (reference_output, pixel_values, grid_thw).
+        Tuple of (reference_output, coreml_inputs_dict, num_real_patches).
+        reference_output is the original model's pooler_output as numpy.
+        coreml_inputs_dict has all keys needed for CoreML prediction.
     """
     import math
 
     in_channels = vision_config.in_channels
     temporal_patch_size = vision_config.temporal_patch_size
     patch_size = vision_config.patch_size
+    head_dim = vision_config.hidden_size // vision_config.num_heads
+    conv2d_channels = in_channels * temporal_patch_size  # 6
 
-    # Create a synthetic grid_thw
-    # num_patches = t * h_patches * w_patches, with t=1 for images
-    # Find h_patches, w_patches such that h*w = num_patches and both are even
-    sqrt_n = int(math.sqrt(num_patches))
-    # Find closest factors where both are even
+    # Find grid dimensions for real patches
+    sqrt_n = int(math.sqrt(num_real_patches))
     h_p = sqrt_n
-    while num_patches % h_p != 0:
+    while num_real_patches % h_p != 0:
         h_p -= 1
-    w_p = num_patches // h_p
-    # Ensure both are even (for spatial_merge_size=2)
+    w_p = num_real_patches // h_p
     if h_p % 2 != 0:
-        h_p *= 2
-        w_p //= 2
+        h_p, w_p = h_p * 2, w_p // 2
     if w_p % 2 != 0:
-        w_p *= 2
-        h_p //= 2
+        h_p, w_p = h_p // 2, w_p * 2
 
     grid_thw = torch.tensor([[1, h_p, w_p]], dtype=torch.int64)
-    print(f"    Reference grid: t=1, h_p={h_p}, w_p={w_p}, total={h_p * w_p}")
+    print(
+        f"    Grid: t=1, h={h_p}, w={w_p} ({num_real_patches} real / {num_total_patches} total)"
+    )
 
-    # Create random pixel input
-    # Shape: (num_patches * temporal_patch_size * in_channels, patch_size * patch_size)
-    # but the model expects flattened: (total_pixels,)
-    # Actually: (num_patches, in_channels * temporal_patch_size * patch_size * patch_size)
+    # Generate random pixel data as flat tensor (original model format)
     pixel_values = torch.randn(
-        num_patches * in_channels * temporal_patch_size * patch_size * patch_size,
+        num_real_patches * in_channels * temporal_patch_size * patch_size * patch_size,
         dtype=torch.float32,
     )
 
+    # Run original model
     with torch.inference_mode():
         output = vision_model(pixel_values, grid_thw=grid_thw, return_dict=True)
+    ref_output = output.pooler_output.numpy()
+    print(f"    Reference output shape: {ref_output.shape}")
 
-    return output.pooler_output.numpy(), pixel_values, grid_thw
+    # Reshape the same pixel data into CoreML input format
+    # flat -> (num_real, in_channels * temporal, patch_h, patch_w)
+    pixel_patches_real = pixel_values.view(
+        num_real_patches, temporal_patch_size * in_channels, patch_size, patch_size
+    )
+    # Pad to num_total_patches with RANDOM NON-ZERO data.
+    # This is intentional: if the attention mask is broken, the random padding
+    # will corrupt real patch outputs, causing the verification to fail.
+    # Zero padding would silently pass even with a broken mask.
+    padding = torch.randn(
+        num_total_patches - num_real_patches,
+        conv2d_channels,
+        patch_size,
+        patch_size,
+        dtype=torch.float32,
+    )
+    pixel_patches = torch.cat([pixel_patches_real, padding], dim=0)
+
+    # Position embeddings
+    cos_real, sin_real = compute_vision_rotary_pos_emb(
+        grid_thw, head_dim, vision_config.spatial_merge_size
+    )
+    cos_pad = torch.zeros(num_total_patches - num_real_patches, head_dim)
+    sin_pad = torch.zeros(num_total_patches - num_real_patches, head_dim)
+    position_cos = torch.cat([cos_real, cos_pad], dim=0)
+    position_sin = torch.cat([sin_real, sin_pad], dim=0)
+
+    # Masks
+    attention_mask = create_padding_attention_mask(num_real_patches, num_total_patches)
+    patch_mask = create_patch_mask(num_real_patches, num_total_patches)
+
+    coreml_inputs = {
+        "pixel_patches": pixel_patches.numpy(),
+        "position_cos": position_cos.numpy(),
+        "position_sin": position_sin.numpy(),
+        "attention_mask": attention_mask.numpy().astype(np.float16),
+        "patch_mask": patch_mask.numpy().astype(np.float16),
+    }
+
+    return ref_output, coreml_inputs, num_real_patches
 
 
 # =============================================================================
@@ -249,19 +290,18 @@ def convert_vision_to_coreml(
     in_channels = 3
     temporal_patch_size = 2
     patch_size = 14
+    conv2d_channels = in_channels * temporal_patch_size  # 3*2=6
 
     # Build enumerated shapes for patch count flexibility
-    # pixel_patches: (num_patches, in_channels, temporal, patch_h, patch_w) — Conv3d-ready
+    # pixel_patches: (num_patches, conv2d_channels, patch_h, patch_w) — Conv2d-ready
     pixel_shapes = []
     cos_shapes = []
     sin_shapes = []
     mask_shapes = []
     patch_mask_shapes = []
 
-    for n in ENUMERATED_PATCH_COUNTS:
-        pixel_shapes.append(
-            (n, in_channels, temporal_patch_size, patch_size, patch_size)
-        )
+    for n in ENUMERATED_PATCH_COUNTS[:5]:
+        pixel_shapes.append((n, conv2d_channels, patch_size, patch_size))
         cos_shapes.append((n, head_dim))
         sin_shapes.append((n, head_dim))
         mask_shapes.append((1, 1, n, n))
@@ -309,111 +349,57 @@ def convert_vision_to_coreml(
 
 def verify_outputs(
     coreml_model,
-    wrapped_model: VisionModelWrapper,
-    num_patches: int,
-    vision_config: object,
+    ref_output: np.ndarray,
+    coreml_inputs: dict,
+    num_real_patches: int,
+    spatial_merge_size: int = 2,
 ):
-    """Verify CoreML outputs match PyTorch wrapped model outputs.
+    """Verify CoreML outputs match the original unpatched model's output.
+
+    This test validates that:
+    1. The CoreML conversion is numerically accurate
+    2. The attention mask correctly blocks padding patches — padding patches
+       use random non-zero data, so a broken mask would corrupt real outputs
+
+    Only compares the real merged tokens (first num_real / merge^2),
+    ignoring padding token outputs.
 
     Args:
         coreml_model: Loaded CoreML model.
-        wrapped_model: The PyTorch VisionModelWrapper.
-        num_patches: Number of patches to test with.
-        vision_config: Vision config.
+        ref_output: Ground-truth output from the original unpatched model.
+        coreml_inputs: Input dict for CoreML prediction (same data used for ref).
+        num_real_patches: Number of real (non-padding) patches.
+        spatial_merge_size: Spatial merge size (default 2).
     """
-    import math
+    coreml_output = coreml_model.predict(coreml_inputs)["vision_embeddings"]
 
-    in_channels = vision_config.in_channels
-    temporal_patch_size = vision_config.temporal_patch_size
-    patch_size = vision_config.patch_size
-    head_dim = vision_config.hidden_size // vision_config.num_heads
+    # The original model returns (num_real_merged, out_dim) channels-last
+    # CoreML returns (1, out_dim, 1, num_total_merged) channels-first
+    # Reshape ref to (1, out_dim, 1, num_real_merged) for comparison
+    ref_cf = ref_output.T[
+        np.newaxis, :, np.newaxis, :
+    ]  # (1, out_dim, 1, num_real_merged)
 
-    # Use fewer real patches than num_patches to test padding
-    num_real = num_patches * 3 // 4  # 75% real patches
-    # Make sure num_real is divisible by 4
-    num_real = (num_real // 4) * 4
-    if num_real < 4:
-        num_real = 4
+    # Only compare real merged tokens (padding tokens are meaningless)
+    num_real_merged = num_real_patches // (spatial_merge_size**2)
+    ref_real = ref_cf[:, :, :, :num_real_merged]
+    cm_real = coreml_output[:, :, :, :num_real_merged]
 
-    # Find grid dimensions
-    sqrt_n = int(math.sqrt(num_real))
-    h_p = sqrt_n
-    while num_real % h_p != 0:
-        h_p -= 1
-    w_p = num_real // h_p
-    if h_p % 2 != 0:
-        h_p, w_p = h_p * 2, w_p // 2
-    if w_p % 2 != 0:
-        h_p, w_p = h_p // 2, w_p * 2
-
-    grid_thw = torch.tensor([[1, h_p, w_p]], dtype=torch.int64)
-
-    print(f"    Testing with {num_real}/{num_patches} real patches (grid: {h_p}×{w_p})")
-
-    # Create inputs — Conv3d-ready shape: (num_patches, in_channels, temporal, h, w)
-    pixel_data = torch.randn(
-        num_real,
-        in_channels,
-        temporal_patch_size,
-        patch_size,
-        patch_size,
-        dtype=torch.float32,
+    abs_diff = np.abs(ref_real - cm_real)
+    print(f"    Original model shape: {ref_output.shape}")
+    print(f"    CoreML shape:         {coreml_output.shape}")
+    print(
+        f"    Comparing {num_real_merged} real merged tokens (of {coreml_output.shape[-1]} total)"
     )
-    # Pad to num_patches
-    padding = torch.zeros(
-        num_patches - num_real,
-        in_channels,
-        temporal_patch_size,
-        patch_size,
-        patch_size,
-        dtype=torch.float32,
-    )
-    pixel_patches = torch.cat([pixel_data, padding], dim=0)
-
-    # Position embeddings (only for real patches, padding gets zeros)
-    cos_real, sin_real = compute_vision_rotary_pos_emb(
-        grid_thw, head_dim, vision_config.spatial_merge_size
-    )
-    # Pad position embeddings to num_patches
-    cos_pad = torch.zeros(num_patches - num_real, head_dim)
-    sin_pad = torch.zeros(num_patches - num_real, head_dim)
-    position_cos = torch.cat([cos_real, cos_pad], dim=0)
-    position_sin = torch.cat([sin_real, sin_pad], dim=0)
-
-    # Masks
-    attention_mask = create_padding_attention_mask(num_real, num_patches)
-    patch_mask = create_patch_mask(num_real, num_patches)
-
-    # PyTorch output
-    with torch.inference_mode():
-        pt_output = wrapped_model(
-            pixel_patches,
-            position_cos,
-            position_sin,
-            attention_mask,
-            patch_mask,
-        ).numpy()
-
-    # CoreML output
-    coreml_input = {
-        "pixel_patches": pixel_patches.numpy(),
-        "position_cos": position_cos.numpy(),
-        "position_sin": position_sin.numpy(),
-        "attention_mask": attention_mask.numpy().astype(np.float16),
-        "patch_mask": patch_mask.numpy().astype(np.float16),
-    }
-    coreml_output = coreml_model.predict(coreml_input)["vision_embeddings"]
-
-    # Compare
-    abs_diff = np.abs(pt_output - coreml_output)
-    print(f"    PyTorch shape: {pt_output.shape}")
-    print(f"    CoreML shape:  {coreml_output.shape}")
     print(f"    Max abs diff:  {abs_diff.max():.6f}")
     print(f"    Mean abs diff: {abs_diff.mean():.6f}")
-    print(f"    Std abs diff:  {abs_diff.std():.6f}")
 
     passed = abs_diff.max() < 0.5  # FP16 tolerance
     print(f"    {'✅ PASSED' if passed else '❌ FAILED'}")
+    if passed:
+        print(
+            "    (Attention mask correctly isolates real patches from random padding)"
+        )
     return passed
 
 
@@ -423,12 +409,13 @@ def verify_outputs(
 
 
 def convert_vision_model(
-    model_name: str = "seba/GLM-OCR",
+    model_name: str = "zai-org/GLM-OCR",
     num_patches: int = 128,
     num_layers: int | None = None,
     output_path: str | None = None,
     verbose: bool = True,
     skip_model_load: bool = False,
+    overwrite: bool = False,
 ):
     """Full vision model conversion pipeline.
 
@@ -439,6 +426,7 @@ def convert_vision_model(
         output_path: Output .mlpackage path.
         verbose: Print info.
         skip_model_load: Skip loading after conversion.
+        overwrite: Overwrite existing output if it exists.
     """
     print("=" * 60)
     print("GLM-OCR Vision Module → CoreML Conversion")
@@ -456,14 +444,19 @@ def convert_vision_model(
 
     head_dim = vision_config.hidden_size // vision_config.num_heads
 
-    # [2] Compute reference (before patching)
-    print("\n[2] Computing reference output...")
+    # [2] Run original model (before patching) for ground-truth reference
+    print("\n[2] Running original model (ground truth)...")
     if not skip_model_load:
-        ref_out, ref_pixels, ref_grid = compute_reference_output(
-            vision_model, num_patches, vision_config
+        # Use 75% real patches to test padding behavior
+        num_real = (num_patches * 3 // 4 // 4) * 4
+        if num_real < 4:
+            num_real = 4
+        ref_output, coreml_inputs, num_real = run_original_vision_model(
+            vision_model, num_real, num_patches, vision_config
         )
-        print(f"    Reference output shape: {ref_out.shape}")
     else:
+        ref_output = coreml_inputs = None
+        num_real = 0
         print("    Skipped (--skip-model-load)")
 
     # [3] Patch layers
@@ -482,13 +475,13 @@ def convert_vision_model(
     in_channels = vision_config.in_channels
     temporal_patch_size = vision_config.temporal_patch_size
     patch_size = vision_config.patch_size
+    conv2d_channels = in_channels * temporal_patch_size  # 3*2=6
 
     example_inputs = (
-        # pixel_patches: Conv3d-ready (num_patches, in_channels, temporal, h, w)
+        # pixel_patches: Conv2d-ready (num_patches, conv2d_channels, h, w)
         torch.randn(
             num_patches,
-            in_channels,
-            temporal_patch_size,
+            conv2d_channels,
             patch_size,
             patch_size,
             dtype=torch.float32,
@@ -518,6 +511,17 @@ def convert_vision_model(
         suffix = f"_layers_{num_layers}" if num_layers else ""
         output_path = f"glm_ocr_vision{suffix}.mlpackage"
 
+    # Handle existing output
+    output_dir = Path(output_path)
+    if output_dir.exists():
+        if overwrite:
+            print(f"    ⚠ Removing existing {output_path}")
+            shutil.rmtree(output_dir)
+        else:
+            print(f"    ❌ Output already exists: {output_path}")
+            print("       Use --overwrite to replace it.")
+            sys.exit(1)
+
     mlmodel = convert_vision_to_coreml(
         traced_model,
         num_patches=num_patches,
@@ -530,10 +534,16 @@ def convert_vision_model(
 
     # [7] Verify
     print("\n[7] Verifying outputs...")
-    if skip_model_load:
+    if skip_model_load or ref_output is None:
         print("    Skipped (--skip-model-load)")
     else:
-        verify_outputs(mlmodel, wrapped_model, num_patches, vision_config)
+        verify_outputs(
+            mlmodel,
+            ref_output,
+            coreml_inputs,
+            num_real,
+            vision_config.spatial_merge_size,
+        )
 
     # Summary
     print("\n" + "=" * 60)
@@ -560,8 +570,8 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default="seba/GLM-OCR",
-        help="HuggingFace model name (default: seba/GLM-OCR)",
+        default="zai-org/GLM-OCR",
+        help="HuggingFace model name (default: zai-org/GLM-OCR)",
     )
     parser.add_argument(
         "--num-patches",
@@ -588,6 +598,11 @@ def main():
         help="Skip loading CoreML model after conversion (saves memory)",
     )
     parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing output .mlpackage if it exists",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         default=True,
@@ -603,6 +618,7 @@ def main():
         output_path=args.output,
         verbose=args.verbose,
         skip_model_load=args.skip_model_load,
+        overwrite=args.overwrite,
     )
 
 

@@ -806,6 +806,31 @@ uv run python examples/inference.py --model-dir ./model --model-name Qwen/Qwen2-
 uv run python examples/inference.py --model-dir ./model --model-name Qwen/Qwen2-0.5B --cache-compiled
 ```
 
+### Output Verification Rules (GENERAL RULE)
+
+**Always verify CoreML conversion against the ORIGINAL unmodified model.**
+
+The ground truth for verification must come from running the original PyTorch model
+*before* any patching, wrapping, or conversion. Never compare CoreML output against a
+wrapped or patched model — that would only test CoreML-vs-wrapper equivalence, not
+whether the conversion preserves the true model behavior.
+
+**Verification pattern:**
+1. Run the original unpatched model on test input → save output as reference
+2. Patch, wrap, trace, and convert the model to CoreML
+3. Feed the **same input data** (reformatted for CoreML) to the converted model
+4. Compare CoreML output against the original model's reference output
+
+**Testing masks and padding:**
+When the CoreML model uses attention masks or padding (e.g., patch-level padding in
+vision models), the verification input **must use random non-zero padding data** — not
+zeros. This ensures a broken mask will actually corrupt real outputs and fail the test.
+Zero padding can silently pass even with a broken mask. Only compare the real token
+outputs, not padding token outputs.
+
+See `vision_conversion_example.py` (`run_original_vision_model` + `verify_outputs`)
+and `lm_conversion_example.py` (`run_original_model`) for reference implementations.
+
 ## Development Workflow
 
 1. Read relevant documentation (this file + module-specific docs)

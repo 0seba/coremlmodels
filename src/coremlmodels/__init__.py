@@ -27,6 +27,18 @@ from .registry import (
     get_architecture_config,
     get_supported_architectures,
 )
+from .glm_ocr_text_model import (
+    GlmOcrLanguageModelWrapper,
+    GlmOcrTextAttentionPatcher,
+    GlmOcrTextDecoderLayerPatcher,
+    GlmOcrTextMLPPatcher,
+    create_glm_ocr_state_specs,
+    patch_glm_ocr_text_layers,
+)
+from .glm_ocr_coreml_pipeline import (
+    GenerationConfig,
+    GlmOcrCoreMLPipeline,
+)
 from .vision_model_wrapper import (
     ENUMERATED_PATCH_COUNTS,
     VisionAttentionPatcher,
@@ -72,6 +84,16 @@ __all__ = [
     "inspect_mil_program",
     # Graph passes
     "register_extended_passes",
+    # GLM-OCR text model
+    "GlmOcrTextAttentionPatcher",
+    "GlmOcrTextMLPPatcher",
+    "GlmOcrTextDecoderLayerPatcher",
+    "GlmOcrLanguageModelWrapper",
+    "patch_glm_ocr_text_layers",
+    "create_glm_ocr_state_specs",
+    # GLM-OCR CoreML pipeline
+    "GenerationConfig",
+    "GlmOcrCoreMLPipeline",
     # Vision model wrapper
     "ENUMERATED_PATCH_COUNTS",
     "VisionAttentionPatcher",
