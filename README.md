@@ -31,12 +31,30 @@ For large models, convert chunks individually to reduce memory usage:
 uv run python examples/lm_conversion_example.py --model Qwen/Qwen3-4B-Instruct-2507 --output qwen3_4b_instruct_2507 --num-chunks 4 --chunk-index 2 --skip-model-load
 ```
 
+GLM-OCR conversion:
+
+```bash
+uv run python examples/glm_ocr_text_conversion.py --export-lm-head --export-embeddings
+uv run python examples/vision_conversion_example.py
+```
+
 ## Inference
 
 Run inference with a converted model:
 
 ```bash
 uv run python examples/inference.py --model-dir ./qwen3_4b_instruct_2507/ --model-name Qwen/Qwen3-4B-Instruct-2507 --max-new-tokens 2048 --chunked --num-chunks 4 --cache-compiled
+```
+
+GLM-OCR CoreML inference:
+
+```bash
+uv run python examples/glm_ocr_coreml_inference.py \
+  --image ./assets/realworld.png \
+  --vision-model ./glm_ocr_vision.mlpackage \
+  --text-model ./glm_ocr_text_seqlen_8.mlpackage \
+  --lm-head ./glm_ocr_lm_head.mlpackage \
+  --embeddings ./glm_ocr_embeddings.npy --cache-compiled --stream
 ```
 
 ## Supported Architectures
