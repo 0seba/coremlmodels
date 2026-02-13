@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import shutil
+import time
 from typing import Optional
 
 import numpy as np
@@ -256,8 +257,60 @@ class GenerationConfig:
     do_sample: bool = False
 
 
+@dataclass
+class TimingStats:
+    preprocessing_ms: float = 0.0
+    vision_encode_ms: float = 0.0
+    prefill_ms: float = 0.0
+    decode_ms: float = 0.0
+    num_tokens_generated: int = 0
+    # MTP-specific
+    mtp_prefill_ms: float = 0.0
+    mtp_prefill_positions: int = 0
+    mtp_draft_steps: int = 0
+    mtp_draft_total_ms: float = 0.0
+    spec_verify_steps: int = 0
+    spec_verify_total_ms: float = 0.0
+    drafts_proposed: int = 0
+    drafts_accepted: int = 0
+
+    @property
+    def decode_tokens_per_sec(self) -> float:
+        if self.decode_ms <= 0:
+            return 0.0
+        return self.num_tokens_generated / (self.decode_ms / 1000.0)
+
+    @property
+    def mtp_avg_step_ms(self) -> float:
+        if self.mtp_draft_steps <= 0:
+            return 0.0
+        return self.mtp_draft_total_ms / self.mtp_draft_steps
+
+    @property
+    def spec_avg_verify_ms(self) -> float:
+        if self.spec_verify_steps <= 0:
+            return 0.0
+        return self.spec_verify_total_ms / self.spec_verify_steps
+
+    @property
+    def spec_acceptance_rate(self) -> float:
+        if self.drafts_proposed <= 0:
+            return 0.0
+        return self.drafts_accepted / self.drafts_proposed
+
+    @property
+    def total_ms(self) -> float:
+        return self.preprocessing_ms + self.vision_encode_ms + self.prefill_ms + self.decode_ms
+
+
 class GlmOcrCoreMLPipeline:
-    """CoreML-backed GLM-OCR inference pipeline."""
+    """CoreML-backed GLM-OCR inference pipeline.
+
+    Supports optional MTP (Multi-Token Prediction) speculative decoding.
+    When an MTP model is provided, the decode loop drafts multiple tokens
+    per round using the cheap single-layer MTP model, then verifies them
+    all in a single batched main model forward pass.
+    """
 
     def __init__(
         self,
@@ -265,6 +318,8 @@ class GlmOcrCoreMLPipeline:
         text_model_path: str | Path,
         lm_head_path: str | Path,
         embeddings_path: str | Path,
+        mtp_model_path: str | Path | None = None,
+        num_spec_steps: int = 3,
         hf_model_name: str = "zai-org/GLM-OCR",
         cache_compiled: bool = False,
         verbose: bool = True,
@@ -293,6 +348,19 @@ class GlmOcrCoreMLPipeline:
             cache_compiled=cache_compiled,
             verbose=verbose,
         )
+
+        # MTP model for speculative decoding (optional)
+        self.mtp_model = None
+        self.num_spec_steps = num_spec_steps
+        if mtp_model_path is not None:
+            mtp_model_path = Path(mtp_model_path)
+            if verbose:
+                print("  Loading MTP model for speculative decoding...")
+            self.mtp_model, _ = load_model_with_cache(
+                mtp_model_path,
+                cache_compiled=cache_compiled,
+                verbose=verbose,
+            )
         all_patch_counts = self._infer_available_vision_patch_counts(vision_model_path)
         if not all_patch_counts:
             raise ValueError("Could not determine available vision patch counts.")
@@ -788,6 +856,149 @@ class GlmOcrCoreMLPipeline:
         probs = probs / probs.sum()
         return int(np.random.choice(len(probs), p=probs))
 
+    # ================================================================
+    # MTP Speculative Decoding Helpers
+    # ================================================================
+
+    def _forward_mtp(
+        self,
+        previous_hidden_states_cf: np.ndarray,
+        input_embeds_cf: np.ndarray,
+        position_id: int,
+        mtp_state,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run one MTP forward pass.
+
+        Args:
+            previous_hidden_states_cf: Hidden states from main model or previous
+                MTP step. Shape: (1, hidden_dim, 1, 1) channels-first.
+            input_embeds_cf: Embedding of the predicted token in channels-first.
+                Shape: (1, hidden_dim, 1, 1).
+            position_id: Current position in MTP's KV cache.
+            mtp_state: CoreML state object for MTP model.
+
+        Returns:
+            Tuple of (mtp_hidden, mtp_hidden_for_head) numpy arrays.
+        """
+        # Position-0 masking: zero input_embeds when position_id == 0
+        if position_id == 0:
+            input_embeds_cf = np.zeros_like(input_embeds_cf)
+
+        result = self.mtp_model.predict(
+            {
+                "previous_hidden_states": previous_hidden_states_cf,
+                "input_embeds": input_embeds_cf,
+                "position_id": np.array([position_id], dtype=np.int32),
+            },
+            mtp_state,
+        )
+        return result["mtp_hidden"], result["mtp_hidden_for_head"]
+
+    def _embed_token_cf(self, token_id: int) -> np.ndarray:
+        """Look up embedding and reshape to channels-first (1, hidden_dim, 1, 1).
+
+        Args:
+            token_id: Token ID to embed.
+
+        Returns:
+            Channels-first embedding array of shape (1, hidden_dim, 1, 1).
+        """
+        embed = self.embeddings[token_id]  # (hidden_dim,)
+        return embed.reshape(1, self.hidden_dim, 1, 1).astype(np.float32)
+
+    def _draft_tokens_mtp(
+        self,
+        last_hidden_cf: np.ndarray,
+        token_index: int,
+        first_token_id: int,
+        mtp_state,
+        mtp_position: int,
+        num_steps: int,
+    ) -> tuple[list[int], int, float, int]:
+        """Draft multiple tokens using MTP chaining.
+
+        Runs the MTP model num_steps times sequentially, feeding each step's
+        hidden output as the next step's previous_hidden_states input.
+
+        Args:
+            last_hidden_cf: Main model hidden output, channels-first.
+                Shape: (1, hidden_dim, 1, seq_len).
+            token_index: Index of the last accepted token in last_hidden_cf.
+            first_token_id: Token sampled from main model (starting point).
+            mtp_state: CoreML state for MTP model.
+            mtp_position: Current position in MTP's KV cache.
+            num_steps: Number of MTP forward passes to chain.
+
+        Returns:
+            Tuple of (draft_token_ids, new_mtp_position, total_mtp_ms, num_mtp_steps).
+        """
+        draft_tokens = []
+        total_mtp_ms = 0.0
+        actual_steps = 0
+        # Extract hidden state for the last accepted token position
+        prev_hidden = last_hidden_cf[:, :, :, token_index:token_index + 1]
+        prev_embed = self._embed_token_cf(first_token_id)
+
+        for _ in range(num_steps):
+            t0 = time.perf_counter()
+            mtp_hidden, mtp_for_head = self._forward_mtp(
+                prev_hidden, prev_embed, mtp_position, mtp_state,
+            )
+            total_mtp_ms += (time.perf_counter() - t0) * 1000.0
+            actual_steps += 1
+            mtp_position += 1
+
+            # Pad MTP output to match lm_head's expected seq_len
+            if mtp_for_head.shape[-1] < self.text_seq_len:
+                mtp_for_head = np.pad(
+                    mtp_for_head,
+                    ((0, 0), (0, 0), (0, 0), (0, self.text_seq_len - mtp_for_head.shape[-1])),
+                    mode="edge",
+                )
+
+            # Greedy decode for draft tokens (argmax, no sampling)
+            logits = self._compute_logits(mtp_for_head, 0, temperature=1.0)
+            draft_token = int(np.argmax(logits))
+            draft_tokens.append(draft_token)
+
+            if draft_token in self.eos_token_ids:
+                break
+
+            # Chain: MTP output becomes next input
+            prev_hidden = mtp_hidden
+            prev_embed = self._embed_token_cf(draft_token)
+
+        return draft_tokens, mtp_position, total_mtp_ms, actual_steps
+
+    def _stream_tokens(
+        self,
+        generated_ids: list[int],
+        streamed_text: str,
+        tokenizer,
+    ) -> str:
+        """Stream newly generated tokens to stdout.
+
+        Args:
+            generated_ids: All generated token IDs so far.
+            streamed_text: Previously streamed text (for delta computation).
+            tokenizer: Tokenizer for decoding.
+
+        Returns:
+            Updated streamed_text string.
+        """
+        current_text = tokenizer.decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if current_text.startswith(streamed_text):
+            delta = current_text[len(streamed_text):]
+        else:
+            delta = current_text
+        if delta:
+            print(delta, end="", flush=True)
+        return current_text
+
     def run(
         self,
         image: Image.Image,
@@ -795,10 +1006,27 @@ class GlmOcrCoreMLPipeline:
         generation_config: Optional[GenerationConfig] = None,
         resized_image_output_path: str | Path | None = None,
         stream_output: bool = False,
-    ) -> str:
+        debug: bool = False,
+        prefill_mtp: bool = False,
+    ) -> tuple[str, TimingStats]:
+        """Run end-to-end OCR: image preprocessing, vision, prefill, decode.
+
+        Supports two decode modes:
+        - Standard (no MTP): one token per main model forward pass.
+        - Speculative (with MTP): draft N tokens with MTP chaining, verify
+          all in a single batched main model forward pass.
+
+        Returns:
+            Tuple of (generated_text, timing_stats).
+        """
         cfg = generation_config or GenerationConfig()
         tokenizer = self.tokenizer if self.tokenizer is not None else self.processor.tokenizer
+        timing = TimingStats()
 
+        # ============================================================
+        # Preprocessing
+        # ============================================================
+        t0 = time.perf_counter()
         (
             input_ids,
             pixel_values,
@@ -817,25 +1045,48 @@ class GlmOcrCoreMLPipeline:
                     f"  Image resized to fit patch budget ({patch_count}/{self.max_vision_patches}) "
                     f"and saved to: {out_path}"
                 )
+        timing.preprocessing_ms = (time.perf_counter() - t0) * 1000.0
 
+        # ============================================================
+        # Vision encoding
+        # ============================================================
+        t0 = time.perf_counter()
         vision_embeds_seq = self._run_vision(pixel_values, image_grid_thw)
         merged_embeds_seq = self._replace_image_tokens_with_vision_embeds(input_ids, vision_embeds_seq)
+        timing.vision_encode_ms = (time.perf_counter() - t0) * 1000.0
 
+        # ============================================================
+        # Prefill (chunked)
+        # ============================================================
+        t0 = time.perf_counter()
         state = self.text_model.make_state()
         current_position = 0
 
+        use_mtp = self.mtp_model is not None
+        collect_prefill_hidden = prefill_mtp and use_mtp
+        prefill_hidden_chunks: list[tuple[np.ndarray, int]] = []
+
         last_hidden = None
         last_token_index = 0
+        num_prefill_chunks = 0
         for start in range(0, merged_embeds_seq.shape[0], self.text_seq_len):
             raw_chunk = merged_embeds_seq[start : start + self.text_seq_len]
             chunk, real_len = self._pad_embed_chunk(raw_chunk, self.text_seq_len)
+            t_chunk = time.perf_counter()
             hidden = self._forward_text_chunk(chunk, current_position, state)
+            chunk_ms = (time.perf_counter() - t_chunk) * 1000.0
+            num_prefill_chunks += 1
+            if debug:
+                print(f"  prefill chunk {num_prefill_chunks} pos={current_position} len={real_len}  {chunk_ms:.1f}ms")
+            if collect_prefill_hidden:
+                prefill_hidden_chunks.append((hidden, real_len))
             current_position += real_len
             last_hidden = hidden
             last_token_index = real_len - 1
 
         if last_hidden is None:
             raise ValueError("No hidden states produced during prefill.")
+        timing.prefill_ms = (time.perf_counter() - t0) * 1000.0
 
         if current_position + cfg.max_new_tokens > self.cache_length:
             raise ValueError(
@@ -843,42 +1094,199 @@ class GlmOcrCoreMLPipeline:
                 f"prefill={current_position}, max_new_tokens={cfg.max_new_tokens}, cache={self.cache_length}."
             )
 
+        # ============================================================
+        # Initialize MTP state if available
+        # ============================================================
+        mtp_state = None
+        mtp_position = 0
+        if use_mtp:
+            mtp_state = self.mtp_model.make_state()
+
+            # Optionally prefill MTP KV cache with main model's hidden
+            # states and embeddings. At each position i, the MTP receives
+            # (main_hidden[i], embed(token[i+1])), building up self-attention
+            # context that mirrors the actual token sequence.
+            if prefill_mtp:
+                t_mtp_pf = time.perf_counter()
+                total_prefill_len = merged_embeds_seq.shape[0]
+                chunk_start = 0
+                for hidden_cf, real_len in prefill_hidden_chunks:
+                    for j in range(real_len):
+                        abs_pos = chunk_start + j
+                        if abs_pos + 1 >= total_prefill_len:
+                            break
+                        prev_hidden = hidden_cf[:, :, :, j : j + 1].astype(
+                            np.float32
+                        )
+                        next_embed_cf = merged_embeds_seq[abs_pos + 1].reshape(
+                            1, self.hidden_dim, 1, 1
+                        ).astype(np.float32)
+                        self._forward_mtp(
+                            prev_hidden, next_embed_cf, mtp_position, mtp_state
+                        )
+                        mtp_position += 1
+                    chunk_start += real_len
+                prefill_hidden_chunks.clear()
+                timing.mtp_prefill_ms = (
+                    time.perf_counter() - t_mtp_pf
+                ) * 1000.0
+                timing.mtp_prefill_positions = mtp_position
+                if debug:
+                    avg = timing.mtp_prefill_ms / max(mtp_position, 1)
+                    print(
+                        f"  MTP prefill: {mtp_position} positions in "
+                        f"{timing.mtp_prefill_ms:.1f}ms ({avg:.1f}ms/pos)"
+                    )
+
+        # Sampling parameters
+        sample_kwargs = dict(
+            do_sample=cfg.do_sample,
+            temperature=cfg.temperature,
+            top_k=cfg.top_k,
+            top_p=cfg.top_p,
+        )
+        temp_for_logits = cfg.temperature if cfg.do_sample else 1.0
+
+        # ============================================================
+        # Decode loop
+        # ============================================================
+        t_decode_start = time.perf_counter()
         generated_ids: list[int] = []
         streamed_text = ""
-        for _ in range(cfg.max_new_tokens):
-            logits = self._compute_logits(last_hidden, last_token_index, cfg.temperature if cfg.do_sample else 1.0)
-            next_token = self._sample_token(
-                logits=logits,
-                do_sample=cfg.do_sample,
-                temperature=cfg.temperature,
-                top_k=cfg.top_k,
-                top_p=cfg.top_p,
-            )
-            if next_token in self.eos_token_ids:
-                break
-            generated_ids.append(next_token)
-            if stream_output:
-                current_text = tokenizer.decode(
-                    generated_ids,
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                )
-                if current_text.startswith(streamed_text):
-                    delta = current_text[len(streamed_text):]
-                else:
-                    delta = current_text
-                if delta:
-                    print(delta, end="", flush=True)
-                streamed_text = current_text
+        hit_eos = False
 
-            token_embed = self.embeddings[np.array([next_token], dtype=np.int32)]
-            token_chunk, real_len = self._pad_embed_chunk(token_embed, self.text_seq_len)
-            last_hidden = self._forward_text_chunk(token_chunk, current_position, state)
-            current_position += real_len
-            last_token_index = 0
+        while len(generated_ids) < cfg.max_new_tokens and not hit_eos:
+            # === Step 1: Sample token from main model ===
+            logits = self._compute_logits(last_hidden, last_token_index, temp_for_logits)
+            token_main = self._sample_token(logits=logits, **sample_kwargs)
+
+            if token_main in self.eos_token_ids:
+                break
+
+            generated_ids.append(token_main)
+            if stream_output:
+                streamed_text = self._stream_tokens(generated_ids, streamed_text, tokenizer)
+
+            # === Standard decode (no MTP) ===
+            if not use_mtp:
+                token_embed = self.embeddings[np.array([token_main], dtype=np.int32)]
+                token_chunk, real_len = self._pad_embed_chunk(token_embed, self.text_seq_len)
+                t_fwd = time.perf_counter()
+                last_hidden = self._forward_text_chunk(token_chunk, current_position, state)
+                fwd_ms = (time.perf_counter() - t_fwd) * 1000.0
+                if debug:
+                    tok_str = tokenizer.decode([token_main])
+                    print(f"  [M] {tok_str!r}  |  main {fwd_ms:.1f}ms")
+                current_position += real_len
+                last_token_index = 0
+                continue
+
+            # === Step 2: Draft N tokens with MTP chaining ===
+            draft_tokens, mtp_position, draft_ms, draft_steps = self._draft_tokens_mtp(
+                last_hidden, last_token_index, token_main,
+                mtp_state, mtp_position, self.num_spec_steps,
+            )
+            timing.mtp_draft_total_ms += draft_ms
+            timing.mtp_draft_steps += draft_steps
+
+            if not draft_tokens:
+                # No drafts produced (edge case). Fall back to standard decode.
+                token_embed = self.embeddings[np.array([token_main], dtype=np.int32)]
+                token_chunk, real_len = self._pad_embed_chunk(token_embed, self.text_seq_len)
+                last_hidden = self._forward_text_chunk(token_chunk, current_position, state)
+                current_position += real_len
+                last_token_index = 0
+                continue
+
+            # === Step 3: Verify all drafts with main model (single batched forward) ===
+            # Build embedding sequence: [token_main, draft_0, draft_1, ...]
+            all_token_ids = [token_main] + draft_tokens
+            all_embeds = np.stack(
+                [self.embeddings[tid] for tid in all_token_ids], axis=0
+            )  # (num_tokens, hidden_dim)
+
+            embed_chunk, real_len = self._pad_embed_chunk(all_embeds, self.text_seq_len)
+            t_verify = time.perf_counter()
+            hidden = self._forward_text_chunk(embed_chunk, current_position, state)
+            verify_ms = (time.perf_counter() - t_verify) * 1000.0
+            timing.spec_verify_total_ms += verify_ms
+            timing.spec_verify_steps += 1
+            timing.drafts_proposed += len(draft_tokens)
+
+            # Verify each draft token against main model's logits.
+            # Position i in hidden corresponds to what the main model predicts
+            # AFTER seeing tokens up to all_token_ids[i]. So hidden[:,:,:,i]
+            # should predict draft_tokens[i] (which is all_token_ids[i+1]).
+            #
+            # IMPORTANT: On rejection we do NOT append the correction token
+            # here. hidden[i+1..] are contaminated by the rejected draft's
+            # KV, so we can only trust hidden[0..i]. The correction (or
+            # bonus when all match) will be sampled naturally at the start
+            # of the next iteration from hidden[num_matching], which is the
+            # last position that only attended to verified-correct KV entries.
+            num_matching_drafts = 0
+            for i, draft in enumerate(draft_tokens):
+                verify_logits = self._compute_logits(hidden, i, temp_for_logits)
+                verify_token = self._sample_token(logits=verify_logits, **sample_kwargs)
+
+                if verify_token == draft and draft not in self.eos_token_ids:
+                    # Draft accepted — matches main model's prediction
+                    generated_ids.append(draft)
+                    num_matching_drafts += 1
+                    if stream_output:
+                        streamed_text = self._stream_tokens(
+                            generated_ids, streamed_text, tokenizer
+                        )
+                else:
+                    # Draft rejected. The correction will be derived in the
+                    # next iteration from hidden[i] (last clean position).
+                    if verify_token in self.eos_token_ids:
+                        hit_eos = True
+                    break
+
+            # When all drafts match, hidden[N] predicts the next token
+            # (the "bonus"), which will be sampled in the next iteration.
+            # No explicit bonus handling needed — it emerges naturally.
+
+            # === Step 4: Update main model position ===
+            # Only advance by token_main + matching drafts. The next token
+            # (correction or bonus) has NOT been fed through the main model,
+            # so its KV is not in the cache yet. It will be processed in
+            # the next iteration when it becomes token_main.
+            timing.drafts_accepted += num_matching_drafts
+
+            num_consumed = 1 + num_matching_drafts
+            current_position += num_consumed
+            last_token_index = num_matching_drafts
+            last_hidden = hidden
+
+            # === Step 5: Roll back MTP position for non-matching drafts ===
+            num_rejected = len(draft_tokens) - num_matching_drafts
+            mtp_position -= num_rejected
+
+            # === Debug output ===
+            if debug:
+                parts = [f"[M] {tokenizer.decode([token_main])!r}"]
+                for d in draft_tokens[:num_matching_drafts]:
+                    parts.append(f"[D] {tokenizer.decode([d])!r}")
+                gen_str = "  ".join(parts)
+                draft_strs = " ".join(
+                    f"{tokenizer.decode([d])!r}" for d in draft_tokens
+                )
+                avg_draft_ms = draft_ms / max(draft_steps, 1)
+                print(
+                    f"  {gen_str}  |  mtp: [{draft_strs}]"
+                    f"  |  verify {verify_ms:.1f}ms  draft {draft_steps}\u00d7{avg_draft_ms:.1f}ms"
+                )
+
+        # ============================================================
+        # Final decode
+        # ============================================================
+        timing.decode_ms = (time.perf_counter() - t_decode_start) * 1000.0
+        timing.num_tokens_generated = len(generated_ids)
 
         if not generated_ids:
-            return ""
+            return "", timing
         final_text = tokenizer.decode(
             generated_ids,
             skip_special_tokens=True,
@@ -888,4 +1296,4 @@ class GlmOcrCoreMLPipeline:
             delta = final_text[len(streamed_text):]
             if delta:
                 print(delta, end="", flush=True)
-        return final_text
+        return final_text, timing

@@ -35,9 +35,18 @@ from .glm_ocr_text_model import (
     create_glm_ocr_state_specs,
     patch_glm_ocr_text_layers,
 )
+from .glm_ocr_mtp_model import (
+    GlmOcrMTPModule,
+    GlmOcrMTPWrapper,
+    convert_glm_ocr_mtp,
+    create_glm_ocr_mtp_state_specs,
+    load_glm_ocr_mtp_module,
+    patch_glm_ocr_mtp_module,
+)
 from .glm_ocr_coreml_pipeline import (
     GenerationConfig,
     GlmOcrCoreMLPipeline,
+    TimingStats,
 )
 from .vision_model_wrapper import (
     ENUMERATED_PATCH_COUNTS,
@@ -91,9 +100,17 @@ __all__ = [
     "GlmOcrLanguageModelWrapper",
     "patch_glm_ocr_text_layers",
     "create_glm_ocr_state_specs",
+    # GLM-OCR MTP model
+    "GlmOcrMTPModule",
+    "GlmOcrMTPWrapper",
+    "convert_glm_ocr_mtp",
+    "create_glm_ocr_mtp_state_specs",
+    "load_glm_ocr_mtp_module",
+    "patch_glm_ocr_mtp_module",
     # GLM-OCR CoreML pipeline
     "GenerationConfig",
     "GlmOcrCoreMLPipeline",
+    "TimingStats",
     # Vision model wrapper
     "ENUMERATED_PATCH_COUNTS",
     "VisionAttentionPatcher",
