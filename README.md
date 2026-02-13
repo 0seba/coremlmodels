@@ -36,6 +36,7 @@ GLM-OCR conversion:
 ```bash
 uv run python examples/glm_ocr_text_conversion.py --export-lm-head --export-embeddings
 uv run python examples/vision_conversion_example.py
+uv run python examples/glm_ocr_mtp_conversion.py
 ```
 
 ## Inference
@@ -55,6 +56,19 @@ uv run python examples/glm_ocr_coreml_inference.py \
   --text-model ./glm_ocr_text_seqlen_8.mlpackage \
   --lm-head ./glm_ocr_lm_head.mlpackage \
   --embeddings ./glm_ocr_embeddings.npy --cache-compiled --stream
+```
+
+GLM-OCR with MTP speculative decoding (~2x faster):
+
+```bash
+uv run python examples/glm_ocr_coreml_inference.py \
+  --image ./assets/realworld.png \
+  --vision-model ./glm_ocr_vision.mlpackage \
+  --text-model ./glm_ocr_text_seqlen_8.mlpackage \
+  --lm-head ./glm_ocr_lm_head.mlpackage \
+  --embeddings ./glm_ocr_embeddings.npy \
+  --mtp-model ./glm_ocr_mtp_seqlen_1.mlpackage \
+  --num-spec-steps 3 --prefill-mtp --cache-compiled --stream
 ```
 
 ## Supported Architectures
