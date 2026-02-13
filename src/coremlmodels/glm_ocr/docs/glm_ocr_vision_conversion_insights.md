@@ -64,3 +64,38 @@ Rotary Position Embeddings involve complex trigonometric operations (`sin`, `cos
 | **Attention** | `GlmOcrVisionAttention` | `VisionAttentionPatcher` | Channels-first, Non-causal, Explicit Mask |
 | **Blocks** | `GlmOcrVisionBlock` | `VisionBlockPatcher` | Channels-first flow |
 | **Merger** | `GlmOcrVisionPatchMerger` | `VisionPatchMergerPatcher` | Handle LayerNorm in channels-first |
+
+---
+
+## 4. Duplicated Table Row Investigation (Final Findings)
+
+### **Observed Issue**
+- OCR on some table images produced duplicated rows even after reconverting the vision model.
+
+### **Initial Hypothesis**
+- Padding tokens in the vision path might still influence outputs after downsampling/merger.
+
+### **What We Verified**
+- Padding suppression in vision attention/downsampling was not the primary cause of the duplicated-row behavior.
+- A real vision bug did exist and was fixed:
+  - The merger input reshape used a direct `view` from `(num_groups, C, 1, 1)` to `(1, C, 1, num_groups)`, which reinterpreted memory incorrectly.
+  - Correct fix: transpose first, then `contiguous().view(...)`.
+
+### **Root Cause (Primary)**
+- The text pipeline used legacy 1D `position_id` semantics during multimodal prefill.
+- GLM-OCR requires multimodal **3D mRoPE position indexing** (`get_rope_index`) for image+text sequences.
+- Because the converted text model expected explicit RoPE embeddings, feeding only sequential 1D positions caused token-position drift in table regions, which manifested as structural duplication.
+
+### **Fix Applied**
+- Added host-side multimodal mRoPE flow to the text path:
+  - Compute multimodal `position_ids` and `rope_delta` with HF reference logic.
+  - Generate and pass explicit `position_cos` / `position_sin` for prefill and decode.
+  - Keep backward-compatible fallback for legacy text models.
+
+### **Supporting Robustness Changes**
+- Cache loading now prefers `.mlmodelc` when present and falls back to `.mlpackage` on load failure.
+- Cache-length detection now infers from available state specs instead of requiring a hardcoded `key_cache` entry.
+
+### **Outcome**
+- After mRoPE alignment, the duplicated-row issue was resolved.
+- Final conclusion: this was primarily a **text positional encoding mismatch**, not a padding-mask failure in vision.

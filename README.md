@@ -68,7 +68,7 @@ uv run python examples/glm_ocr_coreml_inference.py \
   --lm-head ./glm_ocr_lm_head.mlpackage \
   --embeddings ./glm_ocr_embeddings.npy \
   --mtp-model ./glm_ocr_mtp_seqlen_1.mlpackage \
-  --num-spec-steps 3 --prefill-mtp --cache-compiled --stream
+  --num-spec-steps 3 --cache-compiled --stream
 ```
 
 ## Supported Architectures

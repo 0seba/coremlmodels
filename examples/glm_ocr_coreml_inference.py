@@ -111,11 +111,6 @@ def main() -> None:
         help="Number of MTP forward passes per speculation round (default: 3).",
     )
     parser.add_argument(
-        "--prefill-mtp",
-        action="store_true",
-        help="Prefill MTP KV cache with main model hidden states before decoding.",
-    )
-    parser.add_argument(
         "--debug",
         action="store_true",
         help="Print per-step decode debug info: tokens, MTP drafts, and timing.",
@@ -160,7 +155,6 @@ def main() -> None:
         resized_image_output_path=resized_image_output,
         stream_output=args.stream,
         debug=args.debug,
-        prefill_mtp=args.prefill_mtp,
     )
     if args.stream:
         print()

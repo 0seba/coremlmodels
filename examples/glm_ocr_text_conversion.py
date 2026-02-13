@@ -6,7 +6,7 @@ wrapped, traced, and converted.
 
 Key differences from standard LM conversion (lm_conversion_example.py):
 - Uses GlmOcrLanguageModelWrapper instead of LanguageModelWrapper
-  (computes standard 1D RoPE, bypassing model's 3D mRoPE)
+  (accepts explicit host-computed RoPE embeddings for multimodal mRoPE)
 - Uses patch_glm_ocr_text_layers instead of patch_model_attention
   (handles 4-norm decoder layers, fused gate_up_proj MLP,
    interleaved→split-half RoPE weight permutation)
@@ -210,6 +210,10 @@ def convert_glm_ocr_text(
     )
 
     hidden_dim = text_config.hidden_size
+    head_dim = (
+        getattr(text_config, "head_dim", None)
+        or text_config.hidden_size // text_config.num_attention_heads
+    )
 
     # Compute reference output before patching
     reference_output = None
@@ -245,6 +249,8 @@ def convert_glm_ocr_text(
     example_inputs = (
         torch.randn((batch_size, hidden_dim, 1, seq_len), dtype=torch.float32),
         torch.zeros((1,), dtype=torch.int32),
+        wrapped_model.cos_emb[:seq_len].float(),
+        wrapped_model.sin_emb[:seq_len].float(),
     )
     with torch.inference_mode():
         traced_model = torch.jit.trace(wrapped_model, example_inputs)
@@ -279,6 +285,14 @@ def convert_glm_ocr_text(
                 name="position_id",
                 dtype=np.int32,
             ),
+            ct.TensorType(
+                shape=(seq_len, head_dim),
+                name="position_cos",
+            ),
+            ct.TensorType(
+                shape=(seq_len, head_dim),
+                name="position_sin",
+            ),
         ],
         outputs=[
             ct.TensorType(name="output"),
@@ -304,6 +318,8 @@ def convert_glm_ocr_text(
             {
                 "inputs_embeds": reference_input_cf,
                 "position_id": np.array([0], dtype=np.int32),
+                "position_cos": wrapped_model.cos_emb[:seq_len].numpy().astype(np.float32),
+                "position_sin": wrapped_model.sin_emb[:seq_len].numpy().astype(np.float32),
             },
             state,
         )["output"]
@@ -334,6 +350,8 @@ def convert_glm_ocr_text(
             {
                 "inputs_embeds": reference_input_cf,
                 "position_id": np.array([seq_len], dtype=np.int32),
+                "position_cos": wrapped_model.cos_emb[seq_len : (2 * seq_len)].numpy().astype(np.float32),
+                "position_sin": wrapped_model.sin_emb[seq_len : (2 * seq_len)].numpy().astype(np.float32),
             },
             state,
         )["output"]

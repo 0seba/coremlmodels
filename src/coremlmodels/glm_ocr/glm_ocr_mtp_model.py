@@ -32,19 +32,19 @@ from transformers.models.glm_ocr.modeling_glm_ocr import (
 )
 from transformers.utils.hub import cached_file
 
-from .glm_ocr_text_model import (
+from coremlmodels.glm_ocr.glm_ocr_text_model import (
     GlmOcrTextAttentionPatcher,
     GlmOcrTextDecoderLayerPatcher,
     GlmOcrTextMLPPatcher,
 )
-from .graph_passes import register_extended_passes
-from .lm_model_wrapper import (
+from coremlmodels.graph_passes import register_extended_passes
+from coremlmodels.lm_model_wrapper import (
     _generate_causal_mask,
     _index_position_embeddings,
 )
-from .patch_linears import patch_model_linears
-from .patch_rmsnorm import patch_model_rmsnorms
-from .registry import find_target_classes, get_architecture_config
+from coremlmodels.patch_linears import patch_model_linears
+from coremlmodels.patch_rmsnorm import patch_model_rmsnorms
+from coremlmodels.registry import find_target_classes, get_architecture_config
 
 
 def _cached_file(path_or_repo_id: str, filename: str) -> str:

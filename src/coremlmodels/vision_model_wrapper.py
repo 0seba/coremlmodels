@@ -440,6 +440,13 @@ class VisionModelWrapper(nn.Module):
                 attention_mask=attention_mask,
             )
 
+        # Re-zero padding patches before layernorm/downsample.
+        # Residual connections give padding patches non-zero hidden states
+        # even though attention masks them.  Zeroing here prevents any
+        # leakage into the downsample / merger and keeps post_layernorm
+        # statistics clean for the padding positions.
+        hidden_states = hidden_states * patch_mask
+
         # --- Post LayerNorm ---
         hidden_states = self.post_layernorm(hidden_states)
 
@@ -453,7 +460,15 @@ class VisionModelWrapper(nn.Module):
 
         # --- Patch Merger ---
         merged = self.merger(downsampled)  # (num_groups, out_hidden_size, 1, 1)
-        output = merged.view(1, self.out_hidden_size, 1, num_groups)
+
+        # Convert (num_groups, C, 1, 1) -> (1, C, 1, num_groups).
+        # Important: this is a transpose, not a plain view. A direct view would
+        # reinterpret memory layout and scramble group/channel ordering.
+        output = (
+            merged.permute(1, 0, 2, 3)
+            .contiguous()
+            .view(1, self.out_hidden_size, 1, num_groups)
+        )
 
         return output
 

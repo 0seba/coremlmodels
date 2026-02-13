@@ -27,23 +27,19 @@ from .registry import (
     get_architecture_config,
     get_supported_architectures,
 )
-from .glm_ocr_text_model import (
+from .glm_ocr import (
     GlmOcrLanguageModelWrapper,
     GlmOcrTextAttentionPatcher,
     GlmOcrTextDecoderLayerPatcher,
     GlmOcrTextMLPPatcher,
     create_glm_ocr_state_specs,
     patch_glm_ocr_text_layers,
-)
-from .glm_ocr_mtp_model import (
     GlmOcrMTPModule,
     GlmOcrMTPWrapper,
     convert_glm_ocr_mtp,
     create_glm_ocr_mtp_state_specs,
     load_glm_ocr_mtp_module,
     patch_glm_ocr_mtp_module,
-)
-from .glm_ocr_coreml_pipeline import (
     GenerationConfig,
     GlmOcrCoreMLPipeline,
     TimingStats,

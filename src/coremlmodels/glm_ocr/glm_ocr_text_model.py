@@ -6,7 +6,7 @@ This module provides patchers and a wrapper for the GLM-OCR text decoder
 1. Interleaved RoPE → converted to split-half via weight permutation at init
 2. 4 layer norms per decoder layer (sandwich-norm pattern)
 3. Fused gate_up_proj → chunk(2, dim=1) in channels-first format
-4. 3D mRoPE → standard 1D RoPE (identical for text-only generation)
+4. mRoPE support via host-provided position_cos/position_sin embeddings
 
 The interleaved→split-half weight permutation is correct because the dot
 product is permutation-invariant: Q_perm · K_perm = Q · K. V is not permuted,
@@ -15,19 +15,93 @@ permuted Q, so no change needed.
 """
 
 import math
-from typing import Optional, Tuple, Type
+from typing import Optional, Sequence, Tuple, Type
 
 import torch
 import torch.nn as nn
 
-from .lm_model_wrapper import (
+from coremlmodels.lm_model_wrapper import (
     _apply_channels_first_transforms,
     _generate_causal_mask,
     _generate_position_ids,
     _get_sequence_length,
     _index_position_embeddings,
 )
-from .patch_attention import apply_rotary_pos_emb
+from coremlmodels.patch_attention import apply_rotary_pos_emb
+
+
+def compute_glm_ocr_mrope_cos_sin(
+    position_ids: torch.Tensor,
+    head_dim: int,
+    rope_theta: float,
+    partial_rotary_factor: float = 1.0,
+    mrope_section: Optional[Sequence[int]] = None,
+    attention_scaling: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute GLM-OCR text mRoPE cosine/sine embeddings on host.
+
+    Args:
+        position_ids: Position IDs with shape (3, seq_len) or (3, batch, seq_len).
+        head_dim: Attention head dimension.
+        rope_theta: RoPE base theta.
+        partial_rotary_factor: Fraction of head_dim using rotary dimensions.
+        mrope_section: mRoPE sections for height/width/time interleaving.
+        attention_scaling: Optional scaling factor applied to cos/sin.
+
+    Returns:
+        Tuple (cos, sin), each with shape (batch, seq_len, head_dim).
+    """
+    if position_ids.ndim == 2:
+        # (3, seq_len) -> (3, 1, seq_len)
+        position_ids = position_ids.unsqueeze(1)
+
+    if position_ids.ndim != 3 or position_ids.shape[0] != 3:
+        raise ValueError(
+            "position_ids must have shape (3, seq_len) or (3, batch, seq_len), "
+            f"got {tuple(position_ids.shape)}"
+        )
+
+    if mrope_section is None:
+        mrope_section = (8, 12, 12)
+
+    dim = int(head_dim * partial_rotary_factor)
+    if dim <= 0 or dim % 2 != 0:
+        raise ValueError(f"Invalid rotary dim {dim} for head_dim={head_dim}.")
+
+    device = position_ids.device
+    inv_freq = 1.0 / (
+        rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float, device=device) / dim)
+    )
+
+    # Match GlmOcrTextRotaryEmbedding.forward:
+    # inv_freq_expanded: (3, bs, dim/2, 1), position_ids_expanded: (3, bs, 1, seq)
+    inv_freq_expanded = inv_freq[None, None, :, None].expand(
+        3, position_ids.shape[1], -1, 1
+    )
+    position_ids_expanded = position_ids[:, :, None, :].float()
+    freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+    # freqs: (3, bs, seq_len, dim/2)
+
+    if sum(mrope_section) != freqs.shape[-1]:
+        raise ValueError(
+            "mrope_section must sum to dim/2. "
+            f"got sum={sum(mrope_section)} dim/2={freqs.shape[-1]}"
+        )
+
+    chunks = freqs.split(tuple(int(x) for x in mrope_section), dim=-1)
+    freqs = torch.cat([chunk[i % 3] for i, chunk in enumerate(chunks)], dim=-1)
+
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos() * attention_scaling
+    sin = emb.sin() * attention_scaling
+
+    # When partial rotary is used, keep pass-through dimensions unchanged.
+    if dim < head_dim:
+        pad = head_dim - dim
+        cos = torch.cat([cos, torch.ones(*cos.shape[:-1], pad, device=device)], dim=-1)
+        sin = torch.cat([sin, torch.zeros(*sin.shape[:-1], pad, device=device)], dim=-1)
+
+    return cos, sin
 
 
 # ============================================================================
@@ -355,12 +429,13 @@ class GlmOcrTextDecoderLayerPatcher(nn.Module):
 class GlmOcrLanguageModelWrapper(nn.Module):
     """Wrapper for GLM-OCR text decoder optimized for CoreML conversion.
 
-    Similar to LanguageModelWrapper but:
-    - Computes standard 1D RoPE directly (bypasses model's 3D mRoPE rotary_emb)
-    - For text-only generation, all 3 mRoPE dimensions have identical position
-      values, so mRoPE reduces to standard 1D RoPE
+    The wrapper keeps a scalar `position_id` for KV-cache write position and
+    supports explicit RoPE embeddings (`position_cos`, `position_sin`) as
+    inputs. This allows multimodal prefill with GLM-OCR mRoPE while preserving
+    fixed-shape CoreML input tensors.
 
-    Pre-computed cos/sin buffers use the rope_theta from config.rope_parameters.
+    If position embeddings are not provided, it falls back to internal 1D RoPE
+    buffers for backward compatibility.
     """
 
     def __init__(
@@ -420,24 +495,60 @@ class GlmOcrLanguageModelWrapper(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_id: torch.Tensor,
+        position_cos: Optional[torch.Tensor] = None,
+        position_sin: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass through the wrapped GLM-OCR text model.
 
         Args:
             inputs_embeds: Input embeddings in channels-first format.
                           Shape: (batch, hidden_dim, 1, seq_len).
-            position_id: Starting position in the sequence.
-                        Shape: (1,) containing the position index.
+            position_id: Starting KV-cache position.
+                        Shape: (1,) containing the cache index.
+            position_cos: Optional RoPE cosine embeddings for this chunk.
+                          Shape: (seq_len, head_dim) or (1, seq_len, head_dim).
+            position_sin: Optional RoPE sine embeddings for this chunk.
+                          Shape: (seq_len, head_dim) or (1, seq_len, head_dim).
 
         Returns:
             Hidden states in channels-first format.
             Shape: (batch, hidden_dim, 1, seq_len).
         """
         seq_len = _get_sequence_length(inputs_embeds, self.channels_first)
-        position_ids = _generate_position_ids(seq_len, position_id, inputs_embeds.device)
-        position_emb = _index_position_embeddings(self.cos_emb, self.sin_emb, position_ids)
+        cache_position_ids = _generate_position_ids(
+            seq_len, position_id, inputs_embeds.device
+        )
+
+        if position_cos is None or position_sin is None:
+            # Backward-compatible fallback: standard 1D RoPE from cache positions.
+            cos, sin = _index_position_embeddings(
+                self.cos_emb, self.sin_emb, cache_position_ids
+            )
+        else:
+            # Accept (seq_len, head_dim) or (1, seq_len, head_dim).
+            if position_cos.ndim == 2:
+                position_cos = position_cos.unsqueeze(0)
+            if position_sin.ndim == 2:
+                position_sin = position_sin.unsqueeze(0)
+
+            if position_cos.ndim != 3 or position_sin.ndim != 3:
+                raise ValueError(
+                    "position_cos/position_sin must have shape "
+                    "(seq_len, head_dim) or (1, seq_len, head_dim)"
+                )
+
+            if position_cos.shape[1] != seq_len or position_sin.shape[1] != seq_len:
+                raise ValueError(
+                    "position_cos/position_sin seq_len mismatch: "
+                    f"{position_cos.shape[1]} / {position_sin.shape[1]} vs {seq_len}"
+                )
+
+            cos = position_cos
+            sin = position_sin
+
+        position_emb = (cos, sin)
         attention_mask = _generate_causal_mask(
-            self.cache_length, position_ids, inputs_embeds.device
+            self.cache_length, cache_position_ids, inputs_embeds.device
         )
 
         if self.channels_first:

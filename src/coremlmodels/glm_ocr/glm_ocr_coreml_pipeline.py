@@ -25,12 +25,18 @@ from PIL import Image
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 from transformers.utils.hub import cached_file
 
-from .vision_model_wrapper import (
+from coremlmodels.glm_ocr.glm_ocr_text_model import compute_glm_ocr_mrope_cos_sin
+from coremlmodels.vision_model_wrapper import (
     ENUMERATED_PATCH_COUNTS,
     compute_vision_rotary_pos_emb,
     create_padding_attention_mask,
     create_patch_mask,
 )
+
+try:
+    from transformers.models.glm_ocr.modeling_glm_ocr import GlmOcrModel as HFGlmOcrModel
+except Exception:
+    HFGlmOcrModel = None
 
 
 def parse_coremldata_bin(mlmodelc_path: Path) -> dict:
@@ -233,9 +239,16 @@ def load_model_with_cache(
     if compiled_model_exists(mlpackage_path):
         if verbose:
             print(f"  Found cached compiled model: {compiled_path}")
-        model = ct.models.CompiledMLModel(str(compiled_path))
-        specs = parse_coremldata_bin(compiled_path)
-        return model, specs
+        try:
+            model = ct.models.CompiledMLModel(str(compiled_path))
+            specs = parse_coremldata_bin(compiled_path)
+            return model, specs
+        except Exception as exc:
+            if verbose:
+                print(
+                    "  Cached compiled model failed to load; "
+                    f"falling back to .mlpackage ({type(exc).__name__}: {exc})"
+                )
 
     if verbose:
         print(f"  Loading from .mlpackage: {mlpackage_path}")
@@ -391,6 +404,11 @@ class GlmOcrCoreMLPipeline:
                 f"  Vision enumerated patch counts: {list(self.available_vision_patch_counts)} "
                 f"(max={self.max_vision_patches})"
             )
+            if self.max_vision_patches < 4096:
+                print(
+                    "  Warning: low vision patch budget detected. Large pages/tables will "
+                    "be resized aggressively before encoding, which can hurt OCR fidelity."
+                )
 
         self.embeddings = np.load(str(embeddings_path)).astype(np.float32)
         if self.embeddings.ndim != 2:
@@ -412,6 +430,17 @@ class GlmOcrCoreMLPipeline:
         else:
             self.eos_token_ids = {int(eos_token_cfg)}
         self.hidden_dim = self.config.text_config.hidden_size
+        self.text_head_dim = (
+            getattr(self.config.text_config, "head_dim", None)
+            or self.config.text_config.hidden_size // self.config.text_config.num_attention_heads
+        )
+        self.text_rope_theta = float(self.config.text_config.rope_parameters["rope_theta"])
+        self.text_partial_rotary_factor = float(
+            self.config.text_config.rope_parameters.get("partial_rotary_factor", 1.0)
+        )
+        self.text_mrope_section = tuple(
+            int(x) for x in self.config.text_config.rope_parameters.get("mrope_section", [8, 12, 12])
+        )
         self.vision_hidden_dim = self.config.vision_config.out_hidden_size
         self.vision_in_channels = self.config.vision_config.in_channels
         self.vision_temporal_patch_size = self.config.vision_config.temporal_patch_size
@@ -430,6 +459,24 @@ class GlmOcrCoreMLPipeline:
 
         self.text_seq_len = self._get_text_seq_len()
         self.cache_length = self._get_cache_length()
+        self.text_input_names = self._get_text_input_names()
+        self.text_uses_explicit_rope = {"position_cos", "position_sin"}.issubset(
+            self.text_input_names
+        )
+        self._rope_index_helper = type("RopeIndexHelper", (), {})()
+        self._rope_index_helper.config = self.config
+        if verbose:
+            mode = (
+                "explicit (position_cos/position_sin)"
+                if self.text_uses_explicit_rope
+                else "legacy (position_id-only)"
+            )
+            print(f"  Text RoPE mode: {mode}")
+            if self.text_uses_explicit_rope and HFGlmOcrModel is None:
+                print(
+                    "  Warning: HF GlmOcrModel class unavailable; falling back to "
+                    "approximate sequential RoPE positions."
+                )
 
     @staticmethod
     def _cached_file(pretrained_model_name_or_path: str, filename: str) -> str:
@@ -577,19 +624,159 @@ class GlmOcrCoreMLPipeline:
                         return int(spec_shape[3])
         raise ValueError("Could not determine `inputs_embeds` sequence length from text model spec.")
 
-    def _get_cache_length(self) -> int:
-        shape = self.text_specs.get("states", {}).get("key_cache", {}).get("shape", [])
-        if len(shape) >= 3:
-            return int(shape[2])
+    def _get_text_input_names(self) -> set[str]:
+        names = set(self.text_specs.get("inputs", {}).keys())
+        if names:
+            return names
 
         if hasattr(self.text_model, "get_spec"):
-            spec = self.text_model.get_spec()
-            for st in spec.description.state:
-                if st.name == "key_cache":
+            try:
+                spec = self.text_model.get_spec()
+                return {inp.name for inp in spec.description.input}
+            except Exception:
+                return set()
+        return set()
+
+    def _get_cache_length(self) -> int:
+        def _cache_len_from_shape(shape: list[int]) -> int | None:
+            if len(shape) < 3:
+                return None
+            try:
+                cache_len = int(shape[2])
+            except Exception:
+                return None
+            return cache_len if cache_len > 0 else None
+
+        state_map = self.text_specs.get("states", {})
+
+        # Preferred path: explicit key_cache state in parsed specs.
+        key_shape = state_map.get("key_cache", {}).get("shape", [])
+        key_len = _cache_len_from_shape(key_shape)
+        if key_len is not None:
+            return key_len
+
+        # Fallback path: infer from any state that has a cache-like shape.
+        parsed_candidates = []
+        for name, meta in state_map.items():
+            cache_len = _cache_len_from_shape(meta.get("shape", []))
+            if cache_len is not None:
+                parsed_candidates.append((name, cache_len))
+        if parsed_candidates:
+            inferred = max(v for _, v in parsed_candidates)
+            if self.verbose:
+                names = ", ".join(f"{n}:{v}" for n, v in parsed_candidates)
+                print(
+                    "  key_cache state missing in parsed metadata; "
+                    f"inferred cache_length={inferred} from states [{names}]."
+                )
+            return inferred
+
+        # Final fallback for non-compiled MLModel objects with get_spec().
+        if hasattr(self.text_model, "get_spec"):
+            try:
+                spec = self.text_model.get_spec()
+            except Exception:
+                spec = None
+            if spec is not None:
+                spec_candidates = []
+                for st in spec.description.state:
                     spec_shape = list(st.type.multiArrayType.shape)
-                    if len(spec_shape) >= 3:
-                        return int(spec_shape[2])
-        raise ValueError("Could not determine KV cache length from `key_cache` state spec.")
+                    cache_len = _cache_len_from_shape(spec_shape)
+                    if cache_len is not None:
+                        spec_candidates.append((st.name, cache_len))
+
+                for name, cache_len in spec_candidates:
+                    if name == "key_cache":
+                        return cache_len
+
+                if spec_candidates:
+                    inferred = max(v for _, v in spec_candidates)
+                    if self.verbose:
+                        names = ", ".join(f"{n}:{v}" for n, v in spec_candidates)
+                        print(
+                            "  key_cache state missing in model spec; "
+                            f"inferred cache_length={inferred} from states [{names}]."
+                        )
+                    return inferred
+
+        # Last-resort fallback to config when state metadata is unavailable.
+        cfg_cache_len = getattr(self.config.text_config, "max_position_embeddings", None)
+        if cfg_cache_len is not None:
+            cfg_cache_len = int(cfg_cache_len)
+            if cfg_cache_len > 0:
+                if self.verbose:
+                    available = list(state_map.keys())
+                    print(
+                        "  Warning: could not read KV cache length from model states; "
+                        f"using config max_position_embeddings={cfg_cache_len}. "
+                        f"Parsed states: {available}"
+                    )
+                return cfg_cache_len
+
+        available = list(state_map.keys())
+        raise ValueError(
+            "Could not determine KV cache length from text model state spec. "
+            f"Parsed states: {available}"
+        )
+
+    def _compute_multimodal_position_ids(
+        self,
+        input_ids: np.ndarray,
+        image_grid_thw: np.ndarray,
+    ) -> tuple[torch.Tensor, int]:
+        """Compute GLM-OCR multimodal 3D position IDs and rope_delta."""
+        seq_len = int(input_ids.shape[0])
+
+        # Fallback path when HF reference implementation is unavailable.
+        if HFGlmOcrModel is None:
+            pos = (
+                torch.arange(seq_len, dtype=torch.long)
+                .view(1, 1, -1)
+                .expand(3, 1, -1)
+            )
+            return pos, 0
+
+        input_ids_t = torch.from_numpy(input_ids.astype(np.int64)).unsqueeze(0)
+        image_grid_thw_t = torch.from_numpy(image_grid_thw.astype(np.int64))
+        attention_mask_t = torch.ones_like(input_ids_t)
+
+        position_ids, rope_deltas = HFGlmOcrModel.get_rope_index(
+            self._rope_index_helper,
+            input_ids=input_ids_t,
+            image_grid_thw=image_grid_thw_t,
+            video_grid_thw=None,
+            attention_mask=attention_mask_t,
+        )
+        rope_delta = int(rope_deltas[0, 0].item())
+        return position_ids.to(dtype=torch.long), rope_delta
+
+    def _compute_chunk_rope_embeddings(
+        self,
+        position_ids_3d: torch.Tensor,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute mRoPE cos/sin for a chunk of position IDs."""
+        cos, sin = compute_glm_ocr_mrope_cos_sin(
+            position_ids=position_ids_3d,
+            head_dim=self.text_head_dim,
+            rope_theta=self.text_rope_theta,
+            partial_rotary_factor=self.text_partial_rotary_factor,
+            mrope_section=self.text_mrope_section,
+        )
+        # squeeze batch dim (always batch=1 in this pipeline)
+        cos_np = cos[0].cpu().numpy().astype(np.float32)
+        sin_np = sin[0].cpu().numpy().astype(np.float32)
+        return cos_np, sin_np
+
+    def _compute_decode_position_ids(
+        self,
+        cache_position: int,
+        seq_len: int,
+        rope_delta: int,
+    ) -> torch.Tensor:
+        """Build 3D position IDs for decode chunk (batch=1)."""
+        start = int(cache_position) + int(rope_delta)
+        base = torch.arange(seq_len, dtype=torch.long).view(1, 1, -1) + start
+        return base.expand(3, 1, -1)
 
     def _prepare_inputs(self, image: Image.Image, prompt: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         messages = [
@@ -798,17 +985,38 @@ class GlmOcrCoreMLPipeline:
     def _forward_text_chunk(
         self,
         embed_chunk_seq: np.ndarray,
-        position_id: int,
+        cache_position: int,
         state,
+        position_cos_seq: np.ndarray | None = None,
+        position_sin_seq: np.ndarray | None = None,
     ) -> np.ndarray:
         chunk_cf = embed_chunk_seq.T[np.newaxis, :, np.newaxis, :].astype(np.float32)
-        result = self.text_model.predict(
-            {
-                "inputs_embeds": chunk_cf,
-                "position_id": np.array([position_id], dtype=np.int32),
-            },
-            state,
-        )
+        model_inputs = {
+            "inputs_embeds": chunk_cf,
+            "position_id": np.array([cache_position], dtype=np.int32),
+        }
+        if self.text_uses_explicit_rope:
+            if position_cos_seq is None or position_sin_seq is None:
+                raise ValueError(
+                    "Text model expects explicit RoPE inputs, but position_cos/sin were not provided."
+                )
+            model_inputs["position_cos"] = position_cos_seq.astype(np.float32)
+            model_inputs["position_sin"] = position_sin_seq.astype(np.float32)
+
+        try:
+            result = self.text_model.predict(model_inputs, state)
+        except Exception as exc:
+            err = str(exc)
+            if (
+                not self.text_uses_explicit_rope
+                and ("position_cos" in err or "position_sin" in err)
+            ):
+                raise RuntimeError(
+                    "The loaded text CoreML model expects explicit RoPE inputs "
+                    "(`position_cos`, `position_sin`), but pipeline detected legacy mode. "
+                    "Re-load from .mlpackage or clear stale compiled cache."
+                ) from exc
+            raise
         return result["output"]
 
     def _compute_logits(
@@ -1007,7 +1215,6 @@ class GlmOcrCoreMLPipeline:
         resized_image_output_path: str | Path | None = None,
         stream_output: bool = False,
         debug: bool = False,
-        prefill_mtp: bool = False,
     ) -> tuple[str, TimingStats]:
         """Run end-to-end OCR: image preprocessing, vision, prefill, decode.
 
@@ -1055,6 +1262,27 @@ class GlmOcrCoreMLPipeline:
         merged_embeds_seq = self._replace_image_tokens_with_vision_embeds(input_ids, vision_embeds_seq)
         timing.vision_encode_ms = (time.perf_counter() - t0) * 1000.0
 
+        rope_delta = 0
+        prefill_position_cos_seq: np.ndarray | None = None
+        prefill_position_sin_seq: np.ndarray | None = None
+        if self.text_uses_explicit_rope:
+            position_ids_3d, rope_delta = self._compute_multimodal_position_ids(
+                input_ids, image_grid_thw
+            )
+            if int(position_ids_3d.shape[-1]) != int(merged_embeds_seq.shape[0]):
+                raise ValueError(
+                    "Multimodal position ID length mismatch: "
+                    f"{int(position_ids_3d.shape[-1])} vs {int(merged_embeds_seq.shape[0])}"
+                )
+            prefill_position_cos_seq, prefill_position_sin_seq = (
+                self._compute_chunk_rope_embeddings(position_ids_3d)
+            )
+            if debug:
+                print(
+                    f"  mRoPE prefill ready: len={prefill_position_cos_seq.shape[0]} "
+                    f"rope_delta={rope_delta}"
+                )
+
         # ============================================================
         # Prefill (chunked)
         # ============================================================
@@ -1063,7 +1291,7 @@ class GlmOcrCoreMLPipeline:
         current_position = 0
 
         use_mtp = self.mtp_model is not None
-        collect_prefill_hidden = prefill_mtp and use_mtp
+        collect_prefill_hidden = use_mtp
         prefill_hidden_chunks: list[tuple[np.ndarray, int]] = []
 
         last_hidden = None
@@ -1072,8 +1300,21 @@ class GlmOcrCoreMLPipeline:
         for start in range(0, merged_embeds_seq.shape[0], self.text_seq_len):
             raw_chunk = merged_embeds_seq[start : start + self.text_seq_len]
             chunk, real_len = self._pad_embed_chunk(raw_chunk, self.text_seq_len)
+            chunk_position_cos = None
+            chunk_position_sin = None
+            if prefill_position_cos_seq is not None and prefill_position_sin_seq is not None:
+                raw_pos_cos = prefill_position_cos_seq[start : start + self.text_seq_len]
+                raw_pos_sin = prefill_position_sin_seq[start : start + self.text_seq_len]
+                chunk_position_cos, _ = self._pad_embed_chunk(raw_pos_cos, self.text_seq_len)
+                chunk_position_sin, _ = self._pad_embed_chunk(raw_pos_sin, self.text_seq_len)
             t_chunk = time.perf_counter()
-            hidden = self._forward_text_chunk(chunk, current_position, state)
+            hidden = self._forward_text_chunk(
+                chunk,
+                current_position,
+                state,
+                position_cos_seq=chunk_position_cos,
+                position_sin_seq=chunk_position_sin,
+            )
             chunk_ms = (time.perf_counter() - t_chunk) * 1000.0
             num_prefill_chunks += 1
             if debug:
@@ -1102,11 +1343,11 @@ class GlmOcrCoreMLPipeline:
         if use_mtp:
             mtp_state = self.mtp_model.make_state()
 
-            # Optionally prefill MTP KV cache with main model's hidden
-            # states and embeddings. At each position i, the MTP receives
+            # Prefill MTP KV cache with main model's hidden states and
+            # embeddings. At each position i, the MTP receives
             # (main_hidden[i], embed(token[i+1])), building up self-attention
             # context that mirrors the actual token sequence.
-            if prefill_mtp:
+            if prefill_hidden_chunks:
                 t_mtp_pf = time.perf_counter()
                 total_prefill_len = merged_embeds_seq.shape[0]
                 chunk_start = 0
@@ -1171,8 +1412,23 @@ class GlmOcrCoreMLPipeline:
             if not use_mtp:
                 token_embed = self.embeddings[np.array([token_main], dtype=np.int32)]
                 token_chunk, real_len = self._pad_embed_chunk(token_embed, self.text_seq_len)
+                decode_position_cos = None
+                decode_position_sin = None
+                if self.text_uses_explicit_rope:
+                    decode_position_ids = self._compute_decode_position_ids(
+                        current_position, self.text_seq_len, rope_delta
+                    )
+                    decode_position_cos, decode_position_sin = self._compute_chunk_rope_embeddings(
+                        decode_position_ids
+                    )
                 t_fwd = time.perf_counter()
-                last_hidden = self._forward_text_chunk(token_chunk, current_position, state)
+                last_hidden = self._forward_text_chunk(
+                    token_chunk,
+                    current_position,
+                    state,
+                    position_cos_seq=decode_position_cos,
+                    position_sin_seq=decode_position_sin,
+                )
                 fwd_ms = (time.perf_counter() - t_fwd) * 1000.0
                 if debug:
                     tok_str = tokenizer.decode([token_main])
@@ -1193,7 +1449,22 @@ class GlmOcrCoreMLPipeline:
                 # No drafts produced (edge case). Fall back to standard decode.
                 token_embed = self.embeddings[np.array([token_main], dtype=np.int32)]
                 token_chunk, real_len = self._pad_embed_chunk(token_embed, self.text_seq_len)
-                last_hidden = self._forward_text_chunk(token_chunk, current_position, state)
+                decode_position_cos = None
+                decode_position_sin = None
+                if self.text_uses_explicit_rope:
+                    decode_position_ids = self._compute_decode_position_ids(
+                        current_position, self.text_seq_len, rope_delta
+                    )
+                    decode_position_cos, decode_position_sin = self._compute_chunk_rope_embeddings(
+                        decode_position_ids
+                    )
+                last_hidden = self._forward_text_chunk(
+                    token_chunk,
+                    current_position,
+                    state,
+                    position_cos_seq=decode_position_cos,
+                    position_sin_seq=decode_position_sin,
+                )
                 current_position += real_len
                 last_token_index = 0
                 continue
@@ -1206,8 +1477,23 @@ class GlmOcrCoreMLPipeline:
             )  # (num_tokens, hidden_dim)
 
             embed_chunk, real_len = self._pad_embed_chunk(all_embeds, self.text_seq_len)
+            verify_position_cos = None
+            verify_position_sin = None
+            if self.text_uses_explicit_rope:
+                verify_position_ids = self._compute_decode_position_ids(
+                    current_position, self.text_seq_len, rope_delta
+                )
+                verify_position_cos, verify_position_sin = self._compute_chunk_rope_embeddings(
+                    verify_position_ids
+                )
             t_verify = time.perf_counter()
-            hidden = self._forward_text_chunk(embed_chunk, current_position, state)
+            hidden = self._forward_text_chunk(
+                embed_chunk,
+                current_position,
+                state,
+                position_cos_seq=verify_position_cos,
+                position_sin_seq=verify_position_sin,
+            )
             verify_ms = (time.perf_counter() - t_verify) * 1000.0
             timing.spec_verify_total_ms += verify_ms
             timing.spec_verify_steps += 1
