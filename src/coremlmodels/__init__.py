@@ -4,6 +4,14 @@ __version__ = "0.1.0"
 
 from .analysis import analyze_compute_plan, inspect_mil_program
 from .chunked_lm_head import ChunkedLMHead
+from .compiled_model_utils import (
+    cache_compiled_model,
+    compiled_model_exists,
+    extract_specs_from_mlmodel,
+    get_compiled_model_path,
+    load_model_with_cache,
+    parse_coremldata_bin,
+)
 from .export_utils import convert_lm_head, export_embeddings
 from .graph_passes import register_extended_passes
 from .lm_model_wrapper import (
@@ -75,6 +83,13 @@ __all__ = [
     "create_chunked_coreml_state_specs",
     # Chunked LM head
     "ChunkedLMHead",
+    # Compiled model utilities
+    "parse_coremldata_bin",
+    "get_compiled_model_path",
+    "compiled_model_exists",
+    "cache_compiled_model",
+    "extract_specs_from_mlmodel",
+    "load_model_with_cache",
     # Export utilities
     "export_embeddings",
     "convert_lm_head",

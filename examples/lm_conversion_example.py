@@ -60,7 +60,6 @@ import argparse
 import copy
 import gc
 import math
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
@@ -72,53 +71,9 @@ import coremltools as ct
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 
-# =============================================================================
-# Compiled Model Caching Utilities
-# =============================================================================
-
-
-def get_compiled_model_path(mlpackage_path: Path) -> Path:
-    """Get the compiled model path (.mlmodelc) corresponding to an .mlpackage.
-
-    The compiled model is stored in the same directory as the .mlpackage,
-    with the same name but .mlmodelc extension.
-
-    Args:
-        mlpackage_path: Path to the .mlpackage file/directory
-
-    Returns:
-        Path to the corresponding .mlmodelc directory
-    """
-    return mlpackage_path.with_suffix(".mlmodelc")
-
-
-def cache_compiled_model(mlmodel, mlpackage_path: Path, verbose: bool = True) -> Path:
-    """Cache the compiled model (.mlmodelc) to the same directory as the .mlpackage.
-
-    CoreML compiles models to a temporary location. This function copies
-    the compiled model to a persistent location for faster subsequent loads.
-
-    Args:
-        mlmodel: The loaded MLModel object
-        mlpackage_path: Path to the .mlpackage file/directory
-        verbose: Print progress information
-
-    Returns:
-        Path to the cached .mlmodelc directory
-    """
-    compiled_path = get_compiled_model_path(mlpackage_path)
-    temp_compiled_path = mlmodel.get_compiled_model_path()
-
-    if verbose:
-        print(f"    Caching compiled model to: {compiled_path}")
-
-    # Copy the compiled model directory
-    shutil.copytree(temp_compiled_path, str(compiled_path), dirs_exist_ok=True)
-
-    return compiled_path
-
 from coremlmodels import (
     analyze_compute_plan,
+    cache_compiled_model,
     ChunkedLanguageModelWrapper,
     convert_lm_head,
     create_coreml_state_specs,
