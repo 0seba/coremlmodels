@@ -90,6 +90,7 @@ For technical details, implementation guides, and development workflows, see [do
 Additional documentation:
 - [CONVERSION_GUIDE.md](docs/CONVERSION_GUIDE.md) - Detailed conversion options
 - [INFERENCE_GUIDE.md](docs/INFERENCE_GUIDE.md) - Inference configuration
+- [AGENT_INDEX.md](docs/AGENT_INDEX.md) - Runtime block index for coding agents
 
 ## Development
 
