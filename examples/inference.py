@@ -171,16 +171,13 @@ class CoreMLLanguageModel:
 
     @property
     def remaining_context(self) -> int:
-        """Return remaining context capacity."""
         return self.max_context_length - self.current_position
 
     @property
     def context_usage_percent(self) -> float:
-        """Return context usage as percentage."""
         return (self.current_position / self.max_context_length) * 100
 
     def get_context_info(self) -> dict:
-        """Return context usage information."""
         return {
             "current_position": self.current_position,
             "max_context_length": self.max_context_length,
@@ -189,7 +186,6 @@ class CoreMLLanguageModel:
         }
 
     def reset_state(self):
-        """Reset KV cache state to initial values."""
         for i, model in enumerate(self.models):
             self.states[i] = model.make_state()
         self.current_position = 0

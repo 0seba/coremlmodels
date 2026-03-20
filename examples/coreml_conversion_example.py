@@ -1,3 +1,10 @@
+"""Example: Linear-to-Conv2d patching and CoreML conversion of a large MLP.
+
+Demonstrates the full pipeline: patch Linear layers for Neural Engine,
+convert with coremltools, verify PyTorch/CoreML equivalence, and analyse
+the compute plan and MIL program.
+"""
+
 import time
 import torch
 import torch.nn as nn
