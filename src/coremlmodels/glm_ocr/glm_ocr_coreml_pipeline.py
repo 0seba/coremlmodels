@@ -41,6 +41,8 @@ except Exception:
 
 @dataclass
 class GenerationConfig:
+    """Token generation parameters for the OCR pipeline."""
+
     max_new_tokens: int = 512
     temperature: float = 0.0
     top_k: int = 0
@@ -50,6 +52,8 @@ class GenerationConfig:
 
 @dataclass
 class TimingStats:
+    """Timing breakdown for each pipeline stage including MTP speculative decoding."""
+
     preprocessing_ms: float = 0.0
     vision_encode_ms: float = 0.0
     prefill_ms: float = 0.0
@@ -629,7 +633,7 @@ class GlmOcrCoreMLPipeline:
         image: Image.Image,
         prompt: str,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, Image.Image, bool, int]:
-        """Prepare inputs and ensure patch count is within configured limit."""
+        """Iteratively downscale image until patches fit the vision model budget."""
         current_image = image
         resized = False
         max_attempts = 8
@@ -962,16 +966,6 @@ class GlmOcrCoreMLPipeline:
         streamed_text: str,
         tokenizer,
     ) -> str:
-        """Stream newly generated tokens to stdout.
-
-        Args:
-            generated_ids: All generated token IDs so far.
-            streamed_text: Previously streamed text (for delta computation).
-            tokenizer: Tokenizer for decoding.
-
-        Returns:
-            Updated streamed_text string.
-        """
         current_text = tokenizer.decode(
             generated_ids,
             skip_special_tokens=True,

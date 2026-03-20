@@ -34,17 +34,6 @@ def rotate_half(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
 def apply_rotary_pos_emb(
     embed: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:
-    """Apply rotary position embeddings to the input tensor.
-
-    Args:
-        embed: Input embedding tensor.
-        cos: Cosine position embeddings.
-        sin: Sine position embeddings.
-        dim: Dimension for rotation. Defaults to -1.
-
-    Returns:
-        Tensor with rotary position embeddings applied.
-    """
     return (embed * cos) + (rotate_half(embed, dim) * sin)
 
 

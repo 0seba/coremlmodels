@@ -61,23 +61,6 @@ ARCHITECTURE_REGISTRY: Dict[str, ArchitectureConfig] = {
 
 
 def get_architecture_config(model_type: str) -> ArchitectureConfig:
-    """Get the architecture configuration for a model type.
-
-    Args:
-        model_type: The model type string from HuggingFace config
-            (e.g., "qwen2", "qwen3", "llama").
-
-    Returns:
-        ArchitectureConfig for the specified model type.
-
-    Raises:
-        ValueError: If the model type is not in the registry.
-
-    Example:
-        >>> config = get_architecture_config("qwen3")
-        >>> print(config.has_qk_norm)
-        True
-    """
     if model_type not in ARCHITECTURE_REGISTRY:
         supported = ", ".join(sorted(ARCHITECTURE_REGISTRY.keys()))
         raise ValueError(
@@ -91,28 +74,10 @@ def find_target_classes(
     model: nn.Module,
     class_names: Tuple[str, ...],
 ) -> Tuple[Type[nn.Module], ...]:
-    """Find actual class types by name from the model's modules.
+    """Traverse model modules to resolve class name strings to actual types.
 
-    This function traverses the model and finds the actual Python class types
-    that match the given class names. This allows us to use isinstance()
-    checks without importing HuggingFace model internals.
-
-    Args:
-        model: The PyTorch model to search.
-        class_names: Tuple of class name strings to find (e.g., ("Qwen2Attention",)).
-
-    Returns:
-        Tuple of class types found in the model that match the given names.
-
-    Raises:
-        ValueError: If none of the specified class names are found in the model.
-
-    Example:
-        >>> from transformers import AutoModel
-        >>> model = AutoModel.from_pretrained("Qwen/Qwen2-0.5B")
-        >>> classes = find_target_classes(model, ("Qwen2Attention",))
-        >>> print(classes[0].__name__)
-        Qwen2Attention
+    Avoids importing HuggingFace model internals — just walks the module
+    tree and matches type().__name__ against the requested names.
     """
     class_name_set: Set[str] = set(class_names)
     found_classes: Dict[str, Type[nn.Module]] = {}
@@ -132,14 +97,4 @@ def find_target_classes(
 
 
 def get_supported_architectures() -> Tuple[str, ...]:
-    """Get a tuple of all supported architecture names.
-
-    Returns:
-        Tuple of supported model type strings.
-
-    Example:
-        >>> supported = get_supported_architectures()
-        >>> print("qwen2" in supported)
-        True
-    """
     return tuple(sorted(ARCHITECTURE_REGISTRY.keys()))

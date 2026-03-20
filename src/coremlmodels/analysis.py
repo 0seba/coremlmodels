@@ -1,12 +1,21 @@
+"""CoreML model analysis utilities for compute plan and MIL program inspection.
+
+Provides tools to understand how CoreML schedules operations across compute
+devices (CPU, GPU, Neural Engine) and to inspect the compiled MIL intermediate
+representation for debugging fusion patterns and weight layouts.
+"""
+
 import os
 import re
 from coremltools.models.compute_plan import MLComputePlan
 
 
 def analyze_compute_plan(mlmodel):
-    """
-    Analyzes the Compute Plan of a CoreML model and prints a table of operations
-    and their selected/supported compute devices.
+    """Print a table of operations with their selected and supported compute devices.
+
+    Loads the compiled model's compute plan and iterates over all non-const
+    operations, displaying the preferred device, estimated cost, and the set
+    of supported devices for each operation.
     """
     print("\n[Compute Device Analysis]")
     try:
@@ -60,9 +69,10 @@ def analyze_compute_plan(mlmodel):
 
 
 def parse_mil_args(args_str):
-    """
-    Parses a comma-separated argument string, respecting nested parentheses/brackets.
-    Returns a list of split strings.
+    """Split a comma-separated MIL argument string while respecting nested brackets.
+
+    Handles nested parentheses, square brackets, and curly braces so that
+    inner structures like tuples and shape annotations are not split.
     """
     args = []
     current = []
@@ -88,9 +98,11 @@ def parse_mil_args(args_str):
 
 
 def inspect_mil_program(mlmodel):
-    """
-    Parses the compiled MIL structure to provide deep inspection of operations,
-    input shapes, DTypes, and constant values.
+    """Parse the compiled MIL text file and print detailed operation info.
+
+    Reads model.mil from the compiled model package, builds a symbol table
+    of variable shapes and dtypes, then prints each operation with its inputs,
+    outputs, shapes, and constant values (weights vs scalars).
     """
     try:
         compiled_path = mlmodel.get_compiled_model_path()

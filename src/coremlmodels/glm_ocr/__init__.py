@@ -1,3 +1,9 @@
+"""GLM-OCR model components for CoreML conversion and inference.
+
+Provides text decoder patchers (4-norm sandwich, interleaved-to-split-half RoPE),
+MTP speculative decoding module, and a CoreML-backed end-to-end OCR pipeline.
+"""
+
 from coremlmodels.glm_ocr.glm_ocr_text_model import (
     GlmOcrLanguageModelWrapper,
     GlmOcrTextAttentionPatcher,

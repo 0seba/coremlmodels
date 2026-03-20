@@ -120,19 +120,11 @@ def _apply_channels_first_transforms(
     position_emb: Tuple[torch.Tensor, torch.Tensor],
     attention_mask: torch.Tensor,
 ) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor]:
-    """Apply transformations for channels-first format.
-
-    Transposes position embeddings and attention mask to match
-    channels-first (NCHW) tensor layout.
-
-    Args:
-        position_emb: Tuple of (cos, sin) embeddings with shape (1, seq, head_dim).
-        attention_mask: Attention mask with shape (1, 1, 1, cache_len).
+    """Transpose position embeddings and attention mask for NCHW layout.
 
     Returns:
-        Tuple of (transformed_position_emb, transformed_attention_mask).
         - position_emb becomes (cos, sin, cos_t, sin_t) where _t denotes transposed
-        - attention_mask becomes (1, 1, seq_len, cache_len)
+        - attention_mask is transposed to (1, 1, seq_len, cache_len)
     """
     # Transpose embeddings: (1, seq, head_dim) -> (1, head_dim, seq)
     position_emb = (
@@ -244,18 +236,6 @@ class LanguageModelWrapper(nn.Module):
         inputs_embeds: torch.Tensor,
         position_id: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass through the wrapped language model.
-
-        Args:
-            inputs_embeds: Input embeddings in channels-first format.
-                          Shape: (batch, hidden_dim, 1, seq_len).
-            position_id: Starting position in the sequence.
-                        Shape: (1,) containing the position index.
-
-        Returns:
-            Hidden states in channels-first format.
-            Shape: (batch, hidden_dim, 1, seq_len).
-        """
         # Extract sequence length
         seq_len = _get_sequence_length(inputs_embeds, self.channels_first)
 
@@ -434,16 +414,6 @@ class ChunkedLanguageModelWrapper(nn.Module):
         position_id: torch.Tensor,
         debug: bool = False,
     ) -> torch.Tensor:
-        """Forward pass through this chunk's layers.
-
-        Args:
-            hidden_states: Input in channels-first format (batch, hidden_dim, 1, seq_len).
-            position_id: Starting position in the sequence. Shape: (1,).
-            debug: If True, print tensor shapes at each step.
-
-        Returns:
-            Hidden states in channels-first format (batch, hidden_dim, 1, seq_len).
-        """
         if debug:
             print(f"[Chunk {self.chunk_idx}] Input hidden_states shape: {hidden_states.shape}")
 

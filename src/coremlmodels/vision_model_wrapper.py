@@ -197,16 +197,6 @@ class VisionAttentionPatcher(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            hidden_states: (1, hidden_dim, 1, num_patches) in channels-first format.
-            position_embeddings: Tuple of (cos, sin) each (num_patches, head_dim).
-            attention_mask: (1, 1, num_patches, num_patches) with -inf for masked positions.
-
-        Returns:
-            (1, hidden_dim, 1, num_patches) output tensor.
-        """
         bsz = hidden_states.size(0)
 
         # QKV projection — input: (1, hidden_dim, 1, num_patches)
@@ -286,10 +276,7 @@ class VisionAttentionPatcher(nn.Module):
         half_dim: int,
         dim: int,
     ) -> torch.Tensor:
-        """Apply rotary position embedding.
-
-        Uses the same rotate_half as the original vision model (split at midpoint).
-        half_dim must be a Python int constant (not derived from tensor size)
+        """half_dim must be a Python int constant (not derived from tensor size)
         to avoid dynamic int ops that CoreML cannot convert.
         """
         if dim == -2:
@@ -406,20 +393,6 @@ class VisionModelWrapper(nn.Module):
         attention_mask: torch.Tensor,
         patch_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            pixel_patches: (num_patches, in_channels * temporal, patch_h, patch_w)
-                4D input with temporal folded into channels. E.g. (N, 6, 14, 14).
-                Padding patches are zeros.
-            position_cos: (num_patches, head_dim) — 2D RoPE cos.
-            position_sin: (num_patches, head_dim) — 2D RoPE sin.
-            attention_mask: (1, 1, num_patches, num_patches) — attention mask.
-            patch_mask: (1, 1, 1, num_patches) — binary mask for real patches.
-
-        Returns:
-            (1, out_hidden_size, 1, num_merged_tokens) — vision embeddings.
-        """
         # --- Patch Embedding (Conv2d) ---
         # pixel_patches: (N, 6, 14, 14) — temporal already folded into channels
         hidden_states = self.patch_embed_proj(pixel_patches)

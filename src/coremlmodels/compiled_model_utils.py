@@ -168,12 +168,10 @@ def parse_coremldata_bin(
 
 
 def get_compiled_model_path(mlpackage_path: Path) -> Path:
-    """Get the compiled ``.mlmodelc`` path corresponding to an ``.mlpackage``."""
     return mlpackage_path.with_suffix(".mlmodelc")
 
 
 def compiled_model_exists(mlpackage_path: Path) -> bool:
-    """Check if a cached compiled model exists for the given ``.mlpackage``."""
     compiled_path = get_compiled_model_path(mlpackage_path)
     return compiled_path.exists() and compiled_path.is_dir()
 
@@ -191,7 +189,6 @@ def cache_compiled_model(mlmodel: Any, mlpackage_path: Path, verbose: bool = Tru
 
 
 def extract_specs_from_mlmodel(mlmodel: Any) -> dict[str, dict[str, dict[str, list[int]]]]:
-    """Extract input/output/state shapes from an MLModel's spec."""
     spec = mlmodel.get_spec()
     specs = {"inputs": {}, "outputs": {}, "states": {}}
 

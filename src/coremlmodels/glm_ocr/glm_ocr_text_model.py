@@ -207,10 +207,6 @@ class GlmOcrTextAttentionPatcher(nn.Module):
         cache_position: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        """Forward pass with ANE-optimized attention computation.
-
-        Same interface as AttentionPatcher.forward.
-        """
         bsz = hidden_states.size(0)
 
         # Project Q, K, V
@@ -306,14 +302,7 @@ class GlmOcrTextMLPPatcher(nn.Module):
         self.module_name: Optional[str] = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass in channels-first format.
-
-        Args:
-            hidden_states: (batch, hidden_dim, 1, seq_len)
-
-        Returns:
-            (batch, hidden_dim, 1, seq_len)
-        """
+        """Chunks gate_up_proj along dim=1 (channels) instead of dim=-1."""
         up_states = self.gate_up_proj(hidden_states)
         # Chunk along channels (dim=1) instead of last dim
         gate, up_states = up_states.chunk(2, dim=1)
@@ -370,19 +359,7 @@ class GlmOcrTextDecoderLayerPatcher(nn.Module):
         cache_position: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
-        """Forward pass matching LanguageModelWrapper's decoder layer call convention.
-
-        Args:
-            hidden_states: (batch, hidden_dim, 1, seq_len)
-            attention_mask: Causal mask
-            position_ids: Not used (position info in position_embeddings)
-            past_key_values: (key_cache, value_cache) tuple
-            cache_position: Current position in cache
-            position_embeddings: (cos, sin, cos_t, sin_t) for RoPE
-
-        Returns:
-            hidden_states: (batch, hidden_dim, 1, seq_len)
-        """
+        """Matches LanguageModelWrapper's decoder layer call convention."""
         # Pre-attention norm
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -498,22 +475,7 @@ class GlmOcrLanguageModelWrapper(nn.Module):
         position_cos: Optional[torch.Tensor] = None,
         position_sin: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward pass through the wrapped GLM-OCR text model.
-
-        Args:
-            inputs_embeds: Input embeddings in channels-first format.
-                          Shape: (batch, hidden_dim, 1, seq_len).
-            position_id: Starting KV-cache position.
-                        Shape: (1,) containing the cache index.
-            position_cos: Optional RoPE cosine embeddings for this chunk.
-                          Shape: (seq_len, head_dim) or (1, seq_len, head_dim).
-            position_sin: Optional RoPE sine embeddings for this chunk.
-                          Shape: (seq_len, head_dim) or (1, seq_len, head_dim).
-
-        Returns:
-            Hidden states in channels-first format.
-            Shape: (batch, hidden_dim, 1, seq_len).
-        """
+        """Accepts optional mRoPE cos/sin; falls back to internal 1D RoPE buffers."""
         seq_len = _get_sequence_length(inputs_embeds, self.channels_first)
         cache_position_ids = _generate_position_ids(
             seq_len, position_id, inputs_embeds.device
