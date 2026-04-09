@@ -512,7 +512,7 @@ class GlmOcrCoreMLPipeline:
         # Fallback path when HF reference implementation is unavailable.
         if HFGlmOcrModel is None:
             pos = (
-                torch.arange(seq_len, dtype=torch.long)
+                torch.arange(seq_len, dtype=torch.int32)
                 .view(1, 1, -1)
                 .expand(3, 1, -1)
             )
@@ -530,7 +530,7 @@ class GlmOcrCoreMLPipeline:
             attention_mask=attention_mask_t,
         )
         rope_delta = int(rope_deltas[0, 0].item())
-        return position_ids.to(dtype=torch.long), rope_delta
+        return position_ids.to(dtype=torch.int32), rope_delta
 
     def _compute_chunk_rope_embeddings(
         self,
@@ -557,7 +557,7 @@ class GlmOcrCoreMLPipeline:
     ) -> torch.Tensor:
         """Build 3D position IDs for decode chunk (batch=1)."""
         start = int(cache_position) + int(rope_delta)
-        base = torch.arange(seq_len, dtype=torch.long).view(1, 1, -1) + start
+        base = torch.arange(seq_len, dtype=torch.int32).view(1, 1, -1) + start
         return base.expand(3, 1, -1)
 
     def _prepare_inputs(self, image: Image.Image, prompt: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

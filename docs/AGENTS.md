@@ -316,7 +316,7 @@ ANE operates in FP16 which cannot accurately represent position indices beyond ~
 class LanguageModelWrapper(nn.Module):
     def __init__(self, model, cache_length=2048):
         # Pre-compute rotary embeddings for all positions in FP32
-        position_ids = torch.arange(cache_length, dtype=torch.long).unsqueeze(0)
+        position_ids = torch.arange(cache_length, dtype=torch.int32).unsqueeze(0)
         cos_emb, sin_emb = model.rotary_emb(dummy_values, position_ids)
 
         # Store as buffers for indexing
