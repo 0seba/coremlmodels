@@ -160,8 +160,18 @@ def convert_lm_head(
             minimum_deployment_target=ct.target.iOS18,
         )
 
+    import shutil
+    
     # Save model
     output_path = Path(output_path)
+    if output_path.exists():
+        if verbose:
+            print(f"  Cleaning up existing directory: {output_path}")
+        if output_path.is_dir():
+            shutil.rmtree(output_path)
+        else:
+            output_path.unlink()
+            
     output_path.parent.mkdir(parents=True, exist_ok=True)
     mlmodel.save(str(output_path))
 
