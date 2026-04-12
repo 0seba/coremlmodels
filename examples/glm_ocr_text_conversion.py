@@ -79,7 +79,7 @@ def load_glm_ocr_text_model(
 
     model = AutoModel.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,
+        dtype=torch.float32,
         device_map="cpu",
     )
     model.eval()
@@ -476,7 +476,7 @@ def main():
             print("\nExporting embeddings...")
             model = AutoModel.from_pretrained(
                 args.model,
-                torch_dtype=torch.float32,
+                dtype=torch.float32,
                 device_map="cpu",
             )
             model.eval()
@@ -490,7 +490,7 @@ def main():
 
             image_text_model = AutoModelForImageTextToText.from_pretrained(
                 args.model,
-                torch_dtype=torch.float32,
+                dtype=torch.float32,
                 device_map="cpu",
             )
             image_text_model.eval()

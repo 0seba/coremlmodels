@@ -60,9 +60,19 @@ import argparse
 import copy
 import gc
 import math
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
+
+# Silence harmless coremltools int64->int32 precision warnings during MIL conversion
+class _SuppressInt64Warning(logging.Filter):
+    def filter(self, record):
+        if "Saving value type of int64 into a builtin type of int32, might lose precision" in record.getMessage():
+            return False
+        return True
+
+logging.getLogger("coremltools").addFilter(_SuppressInt64Warning())
 
 import numpy as np
 import torch
@@ -172,12 +182,22 @@ def load_model_and_config(
     if verbose:
         print(f"Loading model: {model_name}")
 
-    model = AutoModel.from_pretrained(
+    # Use AutoModelForCausalLM to get both base model and lm_head at once
+    causal_model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,
+        dtype=torch.float32,
         device_map="cpu",
     )
-    model.eval()
+    causal_model.eval()
+
+    # Extract base model (usually stored in .model attribute for Qwen/Llama/GLM)
+    if hasattr(causal_model, "model"):
+        model = causal_model.model
+    elif hasattr(causal_model, "transformer"):
+        model = causal_model.transformer
+    else:
+        # Fallback if attribute naming is different
+        model = causal_model
 
     # Optionally truncate layers
     if num_layers is not None and num_layers < config.num_hidden_layers:
@@ -214,7 +234,7 @@ def load_model_and_config(
         print(f"    RMSNorm classes: {[c.__name__ for c in rmsnorm_classes]}")
 
     return ModelContext(
-        model=model,
+        model=causal_model,  # Store full causal model to have access to lm_head later
         config=config,
         arch_config=arch_config,
         attention_classes=attention_classes,
@@ -407,6 +427,16 @@ def convert_to_coreml(
     Returns:
         Converted CoreML model.
     """
+    import shutil
+    if package_dir is not None:
+        p_dir = Path(package_dir)
+        if p_dir.exists():
+            print(f"    Cleaning up existing path: {package_dir}")
+            if p_dir.is_dir():
+                shutil.rmtree(p_dir)
+            else:
+                p_dir.unlink()
+
     return ct.convert(
         traced_model,
         inputs=[
@@ -466,6 +496,7 @@ def convert_language_model(
     analyze_mil: bool = False,
     skip_model_load: bool = False,
     cache_compiled: bool = False,
+    quantize: int | None = None,
 ):
     """Convert a HuggingFace language model to CoreML.
 
@@ -481,13 +512,19 @@ def convert_language_model(
         analyze_mil: Run MIL program inspection.
         skip_model_load: Skip loading model after conversion to reduce memory.
         cache_compiled: Cache compiled model (.mlmodelc) for faster subsequent loads.
+        quantize: Quantize to 4-bit or 8-bit linear symmetric format.
 
     Returns:
         Converted CoreML model (None if skip_model_load is True).
     """
     print("CoreML Language Model Conversion")
     print("=" * 60)
-    if skip_model_load:
+    
+    actual_skip_load = skip_model_load
+    if quantize:
+        print(f"Model loading after conversion will be forced ON to compress weights (--quantize={quantize})")
+        actual_skip_load = False
+    elif skip_model_load:
         print("Model loading after conversion will be skipped (memory optimization)")
 
     # Load model
@@ -496,15 +533,23 @@ def convert_language_model(
         model_name,
         num_layers,
         verbose,
-        compute_reference=not skip_model_load,
+        compute_reference=not skip_model_load or quantize,
         batch_size=batch_size,
         seq_len=seq_len,
     )
 
+    # Extract base transformer for patching
+    if hasattr(ctx.model, "model"):
+        base_model = ctx.model.model
+    elif hasattr(ctx.model, "transformer"):
+        base_model = ctx.model.transformer
+    else:
+        base_model = ctx.model
+
     # Patch layers
     print("\n[2] Patching model layers...")
     patch_model_layers(
-        ctx.model,
+        base_model,
         ctx.attention_classes,
         ctx.rmsnorm_classes,
         ctx.config,
@@ -515,7 +560,7 @@ def convert_language_model(
     print("\n[3] Creating LanguageModelWrapper...")
     with torch.inference_mode():
         wrapped_model = LanguageModelWrapper(
-            ctx.model,
+            base_model,
             cache_length=cache_length,
             channels_first=True,
             device="cpu",
@@ -550,18 +595,37 @@ def convert_language_model(
         create_coreml_state_specs(wrapped_model),
         input_name="inputs_embeds",
         package_dir=output_path,
-        skip_model_load=skip_model_load,
+        skip_model_load=actual_skip_load,
     )
+    
+    if quantize and mlmodel is not None:
+        import coremltools.optimize.coreml as cto
+        if quantize == 8:
+            print("    Quantizing to 8-bit (linear_symmetric, per_channel)...")
+            op_config = cto.OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int8", granularity="per_channel", weight_threshold=512)
+        elif quantize == 4:
+            print("    Quantizing to 4-bit (linear_symmetric, per_block, block_size=32)...")
+            op_config = cto.OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int4", granularity="per_block", block_size=32, weight_threshold=512)
+        
+        opt_config = cto.OptimizationConfig(global_config=op_config)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            mlmodel = cto.linear_quantize_weights(mlmodel, config=opt_config)
+        
+        mlmodel.save(str(output_path))
+        print(f"    {quantize}-bit quantization complete.")
+
     print(f"    Saved to: {output_path}")
 
     # Cache compiled model if requested
-    if cache_compiled and not skip_model_load and mlmodel is not None:
+    if cache_compiled and not actual_skip_load and mlmodel is not None:
         print("\n[5.5] Caching compiled model...")
         cache_compiled_model(mlmodel, Path(output_path), verbose)
 
     # Verification
     print("\n[6] Verifying outputs...")
-    if skip_model_load:
+    if actual_skip_load:
         print("    Skipped (--skip-model-load flag set, model not loaded)")
     elif ctx.reference_output is None:
         print("    Skipped (reference output not available)")
@@ -586,8 +650,14 @@ def convert_language_model(
         print(f"    Second output sample: {output2.flatten()[:5]}")
 
     # Optional analysis (only if model is loaded)
-    if not skip_model_load:
+    if not actual_skip_load:
         run_model_analysis(mlmodel, analyze_compute, analyze_mil)
+
+    # Clear MLModel object if it was only loaded for quantization
+    if quantize and skip_model_load:
+        mlmodel = None
+        import gc
+        gc.collect()
 
     # Summary
     print("\n" + "=" * 60)
@@ -596,7 +666,7 @@ def convert_language_model(
     print(f"Architecture: {ctx.model_type}")
     print(f"QK-norm enabled: {ctx.arch_config.has_qk_norm}")
 
-    return mlmodel
+    return ctx
 
 
 # =============================================================================
@@ -638,15 +708,17 @@ def convert_single_chunk(
     output_path: Path,
     skip_model_load: bool = False,
     cache_compiled: bool = False,
+    quantize: int | None = None,
 ):
     """Convert a single chunk to CoreML.
 
     Args:
         skip_model_load: Skip loading model after conversion to reduce memory.
         cache_compiled: Cache compiled model (.mlmodelc) for faster subsequent loads.
+        quantize: Quantize the output models to 4-bit or 8-bit linear symmetric format.
 
     Returns:
-        Tuple of (chunk_mlmodel, chunk_wrapper). chunk_mlmodel is None if skip_model_load is True.
+        Tuple of (chunk_mlmodel, chunk_wrapper). chunk_mlmodel is None if skip_model_load is True and not quantized.
     """
     print(f"\n    --- Chunk {chunk_idx} (layers {start_layer}-{end_layer-1}) ---")
 
@@ -705,6 +777,13 @@ def convert_single_chunk(
 
     # Convert and save directly using package_dir
     chunk_path = output_path / f"chunk_{chunk_idx}.mlpackage"
+    
+    # CoreMLTools requires the model to be in memory to apply quantization passes.
+    actual_skip_load = skip_model_load
+    if quantize:
+        print(f"    [Info] --quantize={quantize} overrides --skip-model-load for this step (model must be loaded to compress weights)")
+        actual_skip_load = False
+
     print("    Converting to CoreML...")
     chunk_mlmodel = convert_to_coreml(
         traced_chunk,
@@ -714,13 +793,39 @@ def convert_single_chunk(
         create_chunked_coreml_state_specs(chunk_wrapper),
         input_name="hidden_states",
         package_dir=str(chunk_path),
-        skip_model_load=skip_model_load,
+        skip_model_load=actual_skip_load,
     )
+    
+    if quantize and chunk_mlmodel is not None:
+        import coremltools.optimize.coreml as cto
+        if quantize == 8:
+            print("    Quantizing to 8-bit (linear_symmetric, per_channel)...")
+            op_config = cto.OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int8", granularity="per_channel", weight_threshold=512)
+        elif quantize == 4:
+            print("    Quantizing to 4-bit (linear_symmetric, per_block, block_size=32)...")
+            op_config = cto.OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int4", granularity="per_block", block_size=32, weight_threshold=512)
+            
+        opt_config = cto.OptimizationConfig(global_config=op_config)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            chunk_mlmodel = cto.linear_quantize_weights(chunk_mlmodel, config=opt_config)
+        
+        # Re-save the quantized model over the unquantized package
+        chunk_mlmodel.save(str(chunk_path))
+        print(f"    {quantize}-bit quantization complete.")
+
     print(f"    Saved to: {chunk_path}")
 
     # Cache compiled model if requested
-    if cache_compiled and not skip_model_load and chunk_mlmodel is not None:
+    if cache_compiled and chunk_mlmodel is not None:
         cache_compiled_model(chunk_mlmodel, chunk_path, verbose=True)
+
+    # Clear MLModel object if it was only loaded for quantization
+    if quantize and skip_model_load:
+        chunk_mlmodel = None
+        import gc
+        gc.collect()
 
     return chunk_mlmodel, chunk_wrapper
 
@@ -798,6 +903,7 @@ def convert_chunked_language_model(
     skip_verification: bool = False,
     skip_model_load: bool = False,
     cache_compiled: bool = False,
+    quantize: int | None = None,
 ):
     """Convert a HuggingFace language model to multiple CoreML chunks.
 
@@ -816,6 +922,7 @@ def convert_chunked_language_model(
         skip_verification: Skip output verification to reduce memory usage.
         skip_model_load: Skip loading model after conversion to reduce memory.
         cache_compiled: Cache compiled models (.mlmodelc) for faster subsequent loads.
+        quantize: Quantize the output models to 4-bit or 8-bit linear symmetric format.
 
     Returns:
         List of converted CoreML models (empty if skip_model_load is True).
@@ -827,13 +934,13 @@ def convert_chunked_language_model(
         print(f"Converting only chunk(s): {chunk_indices}")
     if skip_verification:
         print("Verification will be skipped (memory optimization)")
-    if skip_model_load:
+    if skip_model_load and not quantize:
         print("Model loading after conversion will be skipped (memory optimization)")
 
     # Determine if we should compute reference output
     # Skip if: explicit skip_verification, or converting partial chunks, or skip_model_load
     converting_all_chunks = chunk_indices is None or len(chunk_indices) == num_chunks
-    should_compute_reference = not skip_verification and converting_all_chunks and not skip_model_load
+    should_compute_reference = not skip_verification and converting_all_chunks and (not skip_model_load or quantize)
 
     # Load model
     print("\n[1] Loading model and config...")
@@ -845,6 +952,14 @@ def convert_chunked_language_model(
         batch_size=batch_size,
         seq_len=seq_len,
     )
+
+    # Extract base transformer for chunking
+    if hasattr(ctx.model, "model"):
+        base_model = ctx.model.model
+    elif hasattr(ctx.model, "transformer"):
+        base_model = ctx.model.transformer
+    else:
+        base_model = ctx.model
 
     total_layers = ctx.config.num_hidden_layers
 
@@ -862,9 +977,9 @@ def convert_chunked_language_model(
 
     # Pre-compute position embeddings
     print("\n[3] Pre-computing position embeddings...")
-    position_ids = torch.arange(cache_length, dtype=torch.long).unsqueeze(0)
+    position_ids = torch.arange(cache_length, dtype=torch.int32).unsqueeze(0)
     dummy_values = torch.ones(1, dtype=torch.float32)
-    cos_emb, sin_emb = ctx.model.rotary_emb(dummy_values, position_ids)
+    cos_emb, sin_emb = base_model.rotary_emb(dummy_values, position_ids)
     cos_emb = cos_emb[0]
     sin_emb = sin_emb[0]
     print(f"    Position embedding shape: {cos_emb.shape}")
@@ -898,7 +1013,7 @@ def convert_chunked_language_model(
             chunk_idx,
             start_layer,
             end_layer,
-            ctx.model,
+            base_model,
             ctx.config,
             ctx.attention_classes,
             ctx.rmsnorm_classes,
@@ -912,6 +1027,7 @@ def convert_chunked_language_model(
             output_path,
             skip_model_load=skip_model_load,
             cache_compiled=cache_compiled,
+            quantize=quantize,
         )
         if chunk_mlmodel is not None:
             chunk_models.append(chunk_mlmodel)
@@ -969,7 +1085,7 @@ def convert_chunked_language_model(
     else:
         print("\nEnd-to-end verification: SKIPPED")
 
-    return chunk_models
+    return ctx
 
 
 # =============================================================================
@@ -1118,6 +1234,14 @@ Examples:
         "subsequent loads. The compiled model is saved in the same directory with "
         ".mlmodelc extension. Requires model loading (incompatible with --skip-model-load).",
     )
+    parser.add_argument(
+        "--quantize",
+        type=int,
+        choices=[4, 8],
+        default=None,
+        help="Quantize the resulting CoreML chunks to 4-bit or 8-bit linear symmetric format. "
+        "Overrides --skip-model-load during the quantization step as the model must be loaded.",
+    )
 
     args = parser.parse_args()
 
@@ -1134,12 +1258,13 @@ Examples:
             parser.error(f"Invalid --chunk-index value: {args.chunk_index}. Must be integers separated by commas.")
 
     # Validate cache_compiled with skip_model_load
-    if args.cache_compiled and args.skip_model_load:
-        parser.error("--cache-compiled cannot be used with --skip-model-load (model must be loaded to cache)")
+    if args.cache_compiled and args.skip_model_load and not args.quantize:
+        parser.error("--cache-compiled cannot be used with --skip-model-load unless --quantize is also passed")
 
     # Convert main model (unless components-only mode)
+    ctx = None
     if not args.components_only and args.num_chunks > 1:
-        convert_chunked_language_model(
+        ctx = convert_chunked_language_model(
             model_name=args.model,
             num_chunks=args.num_chunks,
             seq_len=args.seq_len,
@@ -1153,9 +1278,10 @@ Examples:
             skip_verification=args.skip_verification,
             skip_model_load=args.skip_model_load,
             cache_compiled=args.cache_compiled,
+            quantize=args.quantize,
         )
     elif not args.components_only:
-        convert_language_model(
+        ctx = convert_language_model(
             model_name=args.model,
             seq_len=args.seq_len,
             cache_length=args.cache_length,
@@ -1174,27 +1300,48 @@ Examples:
         print("EXPORTING ADDITIONAL COMPONENTS")
         print("=" * 60)
 
-        # Load model if needed (for embeddings/LM head export)
-        if not args.quiet:
-            print(f"\nLoading model: {args.model}")
-        config = AutoConfig.from_pretrained(args.model)
-        model = AutoModel.from_pretrained(
-            args.model,
-            torch_dtype=torch.float32,
-            device_map="cpu",
-        )
-        model.eval()
-
-        # Optionally truncate layers (for consistency with main conversion)
-        if args.num_layers is not None and args.num_layers < config.num_hidden_layers:
+        # Reuse model if already loaded during conversion, otherwise load it
+        if ctx is not None:
             if not args.quiet:
-                print(f"Truncating from {config.num_hidden_layers} to {args.num_layers} layers...")
-            model.layers = model.layers[:args.num_layers]
-            config.num_hidden_layers = args.num_layers
+                print(f"\nReusing already loaded model: {args.model}")
+            causal_model = ctx.model
+            config = ctx.config
+            
+            # Extract base model for embeddings/LM head consistency
+            if hasattr(causal_model, "model"):
+                base_model = causal_model.model
+            elif hasattr(causal_model, "transformer"):
+                base_model = causal_model.transformer
+            else:
+                base_model = causal_model
+        else:
+            if not args.quiet:
+                print(f"\nLoading model: {args.model}")
+            config = AutoConfig.from_pretrained(args.model)
+            causal_model = AutoModelForCausalLM.from_pretrained(
+                args.model,
+                dtype=torch.float32,
+                device_map="cpu",
+            )
+            causal_model.eval()
+            
+            if hasattr(causal_model, "model"):
+                base_model = causal_model.model
+            elif hasattr(causal_model, "transformer"):
+                base_model = causal_model.transformer
+            else:
+                base_model = causal_model
+
+            # Optionally truncate layers (for consistency with main conversion)
+            if args.num_layers is not None and args.num_layers < config.num_hidden_layers:
+                if not args.quiet:
+                    print(f"Truncating from {config.num_hidden_layers} to {args.num_layers} layers...")
+                base_model.layers = base_model.layers[:args.num_layers]
+                config.num_hidden_layers = args.num_layers
 
         # Determine output directory
         if args.output:
-            if args.num_chunks > 1:
+            if args.num_chunks > 1 or Path(args.output).is_dir():
                 output_dir = Path(args.output)
             else:
                 output_dir = Path(args.output).parent
@@ -1204,30 +1351,21 @@ Examples:
                 output_dir = Path(f"{model_short_name}_chunked_{args.num_chunks}")
             else:
                 output_dir = Path(".")
+        
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         # Export embeddings
         if args.export_embeddings:
             print("\n[1] Exporting embeddings...")
             embeddings_path = output_dir / "embeddings.npy"
-            export_embeddings(model, embeddings_path, verbose=not args.quiet)
+            export_embeddings(base_model, embeddings_path, verbose=not args.quiet)
 
         # Export LM head
         if args.export_lm_head:
             print("\n[2] Exporting LM head...")
             lm_head_path = output_dir / "lm_head.mlpackage"
 
-            # Load causal LM model to get lm_head
-            if not args.quiet:
-                print("  Loading causal LM model for lm_head...")
-
             try:
-                causal_model = AutoModelForCausalLM.from_pretrained(
-                    args.model,
-                    torch_dtype=torch.float32,
-                    device_map="cpu",
-                )
-                causal_model.eval()
-
                 if hasattr(causal_model, "lm_head"):
                     lm_head = causal_model.lm_head
                 else:
@@ -1251,7 +1389,9 @@ Examples:
                     if args.cache_compiled and lm_head_mlmodel is not None:
                         cache_compiled_model(lm_head_mlmodel, lm_head_path, verbose=not args.quiet)
             except Exception as e:
-                print(f"  [ERROR] Failed to load or convert LM head: {e}")
+                print(f"  [ERROR] Failed to convert LM head: {e}")
+                import traceback
+                traceback.print_exc()
 
         print("\n" + "=" * 60)
         print("EXPORT COMPLETE")

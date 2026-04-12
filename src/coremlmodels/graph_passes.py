@@ -333,12 +333,12 @@ class fuse_layernorm_or_instancenorm(_OriginalFuseLayernormOrInstancenorm):
                     return False
 
                 gamma_var = mb.const(
-                    val=np.squeeze(gamma_var.val),
+                    val=np.squeeze(gamma_var.val).astype(np.float32),
                     name="_fuse_layernorm_gamma",
                 )
 
                 beta_var = mb.const(
-                    val=np.squeeze(beta_var.val) * gamma_var.val,
+                    val=(np.squeeze(beta_var.val) * gamma_var.val).astype(np.float32),
                     name="_fuse_layernorm_beta",
                 )
 
@@ -357,7 +357,7 @@ class fuse_layernorm_or_instancenorm(_OriginalFuseLayernormOrInstancenorm):
             # Verify it's a const (weight) and not another computed value
             if gamma_candidate.val is not None:
                 gamma_var = mb.const(
-                    val=np.squeeze(gamma_candidate.val),
+                    val=np.squeeze(gamma_candidate.val).astype(np.float32),
                     name="_fuse_layernorm_gamma",
                 )
                 beta_var = None

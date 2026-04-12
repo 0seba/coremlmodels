@@ -99,7 +99,7 @@ def load_vision_model(
     model = AutoModel.from_pretrained(
         model_name,
         config=full_config,
-        torch_dtype=torch.float32,
+        dtype=torch.float32,
         trust_remote_code=True,
     )
     model.eval()

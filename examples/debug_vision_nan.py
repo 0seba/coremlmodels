@@ -392,7 +392,7 @@ def main():
     model = AutoModel.from_pretrained(
         args.model,
         config=full_config,
-        torch_dtype=torch.float32,
+        dtype=torch.float32,
         trust_remote_code=True,
     )
     model.eval()

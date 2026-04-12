@@ -57,7 +57,7 @@ def _generate_position_ids(
         Position IDs tensor of shape (1, seq_len).
     """
     position_ids = (
-        torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
+        torch.arange(seq_len, dtype=torch.int32, device=device).unsqueeze(0)
         + position_id
     )
     return position_ids.view(1, -1)
@@ -79,6 +79,7 @@ def _index_position_embeddings(
         Tuple of (cos_emb[position_ids], sin_emb[position_ids]).
         Each has shape (1, seq_len, head_dim).
     """
+    # Ensure position_ids are integers for indexing in PyTorch
     return (cos_emb[position_ids], sin_emb[position_ids])
 
 
@@ -103,15 +104,15 @@ def _generate_causal_mask(
     # Create mask: cache_positions > position_ids
     # Shape: (1, 1, cache_length)
     attention_mask = (
-        torch.arange(cache_length, device=device)[None, None, :]
+        torch.arange(cache_length, dtype=torch.int32, device=device)[None, None, :]
         > position_ids[..., None]
     ).float()
 
     # Add extra dimension for attention heads: (1, 1, 1, cache_length)
     attention_mask = attention_mask.unsqueeze(1)
 
-    # Replace 1s with -inf, keep 0s as 0
-    attention_mask = attention_mask.where(attention_mask == 0, -torch.inf)
+    # Replace 1s with -1e4, keep 0s as 0
+    attention_mask = attention_mask.where(attention_mask == 0, -1e4)
 
     return attention_mask
 
@@ -220,7 +221,7 @@ class LanguageModelWrapper(nn.Module):
         # This avoids FP16 precision issues with exp/cos/sin operations
         # The rotary_emb layer expects: (values, position_ids)
         position_ids = torch.arange(
-            cache_length, dtype=torch.long, device=device
+            cache_length, dtype=torch.int32, device=device
         ).unsqueeze(0)
         dummy_values = torch.ones(1, dtype=torch.float32)
 

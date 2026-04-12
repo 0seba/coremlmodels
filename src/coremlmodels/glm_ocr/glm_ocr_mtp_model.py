@@ -343,7 +343,7 @@ class GlmOcrMTPWrapper(nn.Module):
             - mtp_hidden_for_head: Normalized hidden states for LM head.
         """
         # Index RoPE embeddings
-        position_ids = position_id.long().view(1, 1)
+        position_ids = position_id.to(torch.int32).view(1, 1)
         position_emb = _index_position_embeddings(
             self.cos_emb, self.sin_emb, position_ids
         )
@@ -473,7 +473,7 @@ def _compute_mtp_reference_output(
 
         # Compute rotary position embeddings for the decoder layer
         # The HF decoder layer expects position_embeddings=(cos, sin)
-        position_ids = torch.zeros(1, 1, dtype=torch.long)
+        position_ids = torch.zeros(1, 1, dtype=torch.int32)
         rope_theta = text_config.rope_parameters["rope_theta"]
         num_heads = int(text_config.num_attention_heads)
         head_dim = int(

@@ -90,7 +90,7 @@ def main():
         print("\n[1] Loading model for embeddings...")
         model = AutoModel.from_pretrained(
             args.model,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
             device_map="cpu",
         )
         model.eval()
@@ -103,7 +103,7 @@ def main():
         print("\n[2] Loading causal LM model for LM head...")
         causal_model = AutoModelForCausalLM.from_pretrained(
             args.model,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
             device_map="cpu",
         )
         causal_model.eval()
